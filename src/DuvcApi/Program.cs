@@ -292,11 +292,19 @@ namespace DuvcApi
                     path = "/";
                 }
 
-                if (!path.Equals("/status", StringComparison.OrdinalIgnoreCase) &&
-                    !path.Equals("/health", StringComparison.OrdinalIgnoreCase))
+                string bodyText = null;
+                if (request.HasEntityBody)
                 {
-                    Logger.Info(string.Format(CultureInfo.InvariantCulture, "{0} {1}", request.HttpMethod, path));
+                    using (var reader = new StreamReader(request.InputStream, request.ContentEncoding ?? Encoding.UTF8))
+                    {
+                        bodyText = reader.ReadToEnd();
+                    }
                 }
+
+                Logger.Info(string.Format(CultureInfo.InvariantCulture, "{0} {1} {2}",
+                    request.HttpMethod,
+                    path,
+                    string.IsNullOrWhiteSpace(bodyText) ? string.Empty : bodyText));
 
                 if (path.Equals("/health", StringComparison.OrdinalIgnoreCase) && request.HttpMethod == "GET")
                 {
@@ -324,19 +332,19 @@ namespace DuvcApi
 
                 if (path.Equals("/api/usb-camera/set", StringComparison.OrdinalIgnoreCase) && request.HttpMethod == "POST")
                 {
-                    HandleSetByName(response, ReadJsonBody<SetRequest>(request));
+                    HandleSetByName(response, ReadJsonBody<SetRequest>(bodyText));
                     return;
                 }
 
                 if (path.Equals("/api/usb-camera/get", StringComparison.OrdinalIgnoreCase) && request.HttpMethod == "POST")
                 {
-                    HandleGetByName(response, ReadJsonBody<GetRequest>(request));
+                    HandleGetByName(response, ReadJsonBody<GetRequest>(bodyText));
                     return;
                 }
 
                 if (path.Equals("/api/usb-camera/reset", StringComparison.OrdinalIgnoreCase) && request.HttpMethod == "POST")
                 {
-                    HandleResetByName(response, ReadJsonBody<ResetRequest>(request));
+                    HandleResetByName(response, ReadJsonBody<ResetRequest>(bodyText));
                     return;
                 }
 
@@ -354,13 +362,13 @@ namespace DuvcApi
                     switch (action)
                     {
                         case "set":
-                            HandleSet(response, index, ReadJsonBody<SetRequest>(request));
+                            HandleSet(response, index, ReadJsonBody<SetRequest>(bodyText));
                             return;
                         case "get":
-                            HandleGet(response, index, ReadJsonBody<GetRequest>(request));
+                            HandleGet(response, index, ReadJsonBody<GetRequest>(bodyText));
                             return;
                         case "reset":
-                            HandleReset(response, index, ReadJsonBody<ResetRequest>(request));
+                            HandleReset(response, index, ReadJsonBody<ResetRequest>(bodyText));
                             return;
                         case "capabilities":
                             HandleCapabilities(response, index);
@@ -627,28 +635,19 @@ namespace DuvcApi
             response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
         }
 
-        private T ReadJsonBody<T>(HttpListenerRequest request) where T : class
+        private T ReadJsonBody<T>(string body) where T : class
         {
-            if (!request.HasEntityBody)
+            if (string.IsNullOrWhiteSpace(body))
             {
                 return null;
             }
-
-            using (var reader = new StreamReader(request.InputStream, request.ContentEncoding ?? Encoding.UTF8))
+            try
             {
-                var body = reader.ReadToEnd();
-                if (string.IsNullOrWhiteSpace(body))
-                {
-                    return null;
-                }
-                try
-                {
-                    return _json.Deserialize<T>(body);
-                }
-                catch (InvalidOperationException ex)
-                {
-                    throw new ArgumentException("Invalid JSON body.", ex);
-                }
+                return _json.Deserialize<T>(body);
+            }
+            catch (InvalidOperationException ex)
+            {
+                throw new ArgumentException("Invalid JSON body.", ex);
             }
         }
 
@@ -2570,8 +2569,27 @@ namespace DuvcApi
                         return;
                 }
 
-                AppendLine(string.Format(CultureInfo.InvariantCulture, "REST {0} -> {1} {2}", command, result.statusCode, result.output));
+                var requestLabel = BuildRequestLabel(command, setRequest, wsRequest);
+                AppendLine(string.Format(CultureInfo.InvariantCulture, "REST {0} -> {1} {2}", requestLabel, result.statusCode, result.output));
             }
+        }
+
+        private string BuildRequestLabel(string command, SetRequest setRequest, WebSocketCommand wsRequest)
+        {
+            if (command == "set" && setRequest != null)
+            {
+                return string.Format(CultureInfo.InvariantCulture, "set {0} {1}", setRequest.domain, setRequest.property);
+            }
+            if (command == "get" && wsRequest != null)
+            {
+                var props = wsRequest.properties == null ? string.Empty : string.Join(",", wsRequest.properties);
+                return string.Format(CultureInfo.InvariantCulture, "get {0} {1}", wsRequest.domain, props);
+            }
+            if (command == "reset" && wsRequest != null)
+            {
+                return string.Format(CultureInfo.InvariantCulture, "reset {0} {1}", wsRequest.domain, wsRequest.property);
+            }
+            return command;
         }
 
         private void ToggleWebSocket()
