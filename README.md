@@ -337,6 +337,15 @@ All settings are optional and read from environment variables:
 - `DUVC_API_ALLOWED_ORIGINS` (comma-separated list; default allows all)
 - `DUVC_CLI_PATH` (override embedded `duvc-cli.exe` path)
 
+## Camera Property Optimization
+
+See [docs/camera-optimization-integration.md](docs/camera-optimization-integration.md)
+for integration documentation on analyzing ROI images and optimizing all
+camera properties (Exposure, Focus, Gain, Brightness, Contrast, WhiteBalance,
+Sharpness, Saturation, Gamma, Hue, BacklightCompensation) via the API.
+Includes JavaScript analysis algorithms, an 8-step optimization pipeline
+with parallel execution, and guidance on sequential vs parallel property tuning.
+
 ## Notes
 
 - The API only listens on `127.0.0.1` for safety.
