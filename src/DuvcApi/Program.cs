@@ -1306,7 +1306,18 @@ namespace DuvcApi
             RegisterUrlAcl(port);
 
             var status = ServiceStatusHelper.GetStatus(serviceName);
-            if (!status.IsInstalled)
+            if (status.IsInstalled)
+            {
+                // Upgrade: stop the running service and switch to demand start
+                // so the scheduled task owns the API lifecycle (avoids port conflict)
+                if (status.IsRunning)
+                {
+                    RunSc(string.Format(CultureInfo.InvariantCulture, "stop {0}", serviceName));
+                }
+                RunSc(string.Format(CultureInfo.InvariantCulture,
+                    "config {0} start= demand", serviceName));
+            }
+            else
             {
                 var binPath = string.Format(CultureInfo.InvariantCulture, "\"{0}\" service", exePath);
 
