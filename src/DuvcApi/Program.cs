@@ -1299,39 +1299,45 @@ namespace DuvcApi
 
         public static int Install(string serviceName, string displayName)
         {
-            var status = ServiceStatusHelper.GetStatus(serviceName);
-            if (status.IsInstalled)
-            {
-                if (!status.IsRunning)
-                {
-                    RunSc(string.Format(CultureInfo.InvariantCulture, "start {0}", serviceName));
-                }
-                InstallTrayTask(Process.GetCurrentProcess().MainModule.FileName);
-                TryStartTrayNow(Process.GetCurrentProcess().MainModule.FileName);
-                Console.WriteLine("Service already installed.");
-                return 0;
-            }
-
             var exePath = Process.GetCurrentProcess().MainModule.FileName;
-            var binPath = string.Format(CultureInfo.InvariantCulture, "\"{0}\" service", exePath);
+            var port = Program.GetPort();
 
-            var createResult = RunSc(string.Format(CultureInfo.InvariantCulture, "create {0} binPath= \"{1}\" start= auto DisplayName= \"{2}\"", serviceName, binPath, displayName));
-            if (createResult != 0)
+            // Register URL ACL so non-admin kiosk users can bind HttpListener
+            RegisterUrlAcl(port);
+
+            var status = ServiceStatusHelper.GetStatus(serviceName);
+            if (!status.IsInstalled)
             {
-                return createResult;
+                var binPath = string.Format(CultureInfo.InvariantCulture, "\"{0}\" service", exePath);
+
+                var createResult = RunSc(string.Format(CultureInfo.InvariantCulture,
+                    "create {0} binPath= \"{1}\" start= demand DisplayName= \"{2}\"",
+                    serviceName, binPath, displayName));
+                if (createResult != 0)
+                {
+                    return createResult;
+                }
+
+                RunSc(string.Format(CultureInfo.InvariantCulture,
+                    "description {0} \"Local API for DUVC camera control\"", serviceName));
             }
 
-            RunSc(string.Format(CultureInfo.InvariantCulture, "description {0} \"Local API for DUVC camera control\"", serviceName));
-            var startResult = RunSc(string.Format(CultureInfo.InvariantCulture, "start {0}", serviceName));
-            InstallTrayTask(exePath);
-            TryStartTrayNow(exePath);
-            return startResult;
+            // Auto-restart service on failure (5s, 10s, 30s delays)
+            ConfigureRecovery(serviceName);
+
+            // The API runs via scheduled task in the interactive user session (not the service)
+            // because Session 0 services cannot access DirectShow/UVC camera devices
+            InstallAppTask(exePath);
+            TryStartAppNow(exePath);
+            Console.WriteLine("Installed. API will start automatically on user logon.");
+            return 0;
         }
 
         public static int Uninstall(string serviceName)
         {
             RunSc(string.Format(CultureInfo.InvariantCulture, "stop {0}", serviceName));
-            UninstallTrayTask();
+            UninstallAppTask();
+            RemoveUrlAcl(Program.GetPort());
             return RunSc(string.Format(CultureInfo.InvariantCulture, "delete {0}", serviceName));
         }
 
@@ -1349,9 +1355,9 @@ namespace DuvcApi
 
             using (var process = Process.Start(startInfo))
             {
-                process.WaitForExit(10000);
                 var stdout = process.StandardOutput.ReadToEnd();
                 var stderr = process.StandardError.ReadToEnd();
+                process.WaitForExit(10000);
 
                 if (process.ExitCode != 0)
                 {
@@ -1363,21 +1369,21 @@ namespace DuvcApi
             }
         }
 
-        private static void InstallTrayTask(string exePath)
+        private static void InstallAppTask(string exePath)
         {
-            var taskCommand = string.Format(CultureInfo.InvariantCulture, "\"{0}\" tray", exePath);
+            var taskCommand = string.Format(CultureInfo.InvariantCulture, "\"{0}\" app", exePath);
             RunSchtasks(string.Format(CultureInfo.InvariantCulture,
                 "/Create /F /SC ONLOGON /RL HIGHEST /RU \"INTERACTIVE\" /TN \"{0}\" /TR \"{1}\"",
                 TrayTaskName,
                 taskCommand));
         }
 
-        private static void UninstallTrayTask()
+        private static void UninstallAppTask()
         {
             RunSchtasks(string.Format(CultureInfo.InvariantCulture, "/Delete /F /TN \"{0}\"", TrayTaskName));
         }
 
-        private static void TryStartTrayNow(string exePath)
+        private static void TryStartAppNow(string exePath)
         {
             try
             {
@@ -1391,14 +1397,14 @@ namespace DuvcApi
                     Process.Start(new ProcessStartInfo
                     {
                         FileName = exePath,
-                        Arguments = "tray",
+                        Arguments = "app",
                         UseShellExecute = true
                     });
                 }
             }
             catch
             {
-                // ignore tray start errors
+                // ignore app start errors
             }
         }
 
@@ -1416,9 +1422,9 @@ namespace DuvcApi
 
             using (var process = Process.Start(startInfo))
             {
-                process.WaitForExit(10000);
                 var stdout = process.StandardOutput.ReadToEnd();
                 var stderr = process.StandardError.ReadToEnd();
+                process.WaitForExit(10000);
 
                 if (process.ExitCode != 0)
                 {
@@ -1426,6 +1432,49 @@ namespace DuvcApi
                     Console.Error.WriteLine(stderr);
                 }
 
+                return process.ExitCode;
+            }
+        }
+
+        private static void ConfigureRecovery(string serviceName)
+        {
+            // restart after 5s, 10s, 30s; reset failure count after 24h
+            RunSc(string.Format(CultureInfo.InvariantCulture,
+                "failure {0} reset= 86400 actions= restart/5000/restart/10000/restart/30000",
+                serviceName));
+        }
+
+        private static void RegisterUrlAcl(int port)
+        {
+            var url = string.Format(CultureInfo.InvariantCulture, "http://127.0.0.1:{0}/", port);
+            // Remove existing ACL first (ignore errors if not present)
+            RunNetsh(string.Format(CultureInfo.InvariantCulture, "http delete urlacl url={0}", url));
+            RunNetsh(string.Format(CultureInfo.InvariantCulture, "http add urlacl url={0} user=Everyone", url));
+        }
+
+        private static void RemoveUrlAcl(int port)
+        {
+            var url = string.Format(CultureInfo.InvariantCulture, "http://127.0.0.1:{0}/", port);
+            RunNetsh(string.Format(CultureInfo.InvariantCulture, "http delete urlacl url={0}", url));
+        }
+
+        private static int RunNetsh(string arguments)
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "netsh.exe",
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using (var process = Process.Start(startInfo))
+            {
+                var stdout = process.StandardOutput.ReadToEnd();
+                var stderr = process.StandardError.ReadToEnd();
+                process.WaitForExit(10000);
                 return process.ExitCode;
             }
         }
