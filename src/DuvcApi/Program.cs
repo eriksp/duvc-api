@@ -1506,6 +1506,7 @@ namespace DuvcApi
         private ToolStripMenuItem _installServiceItem;
         private ToolStripMenuItem _uninstallServiceItem;
         private Form _menuHost;
+        private AutoUpdater _updater;
 
         private TrayApp(bool startServer)
         {
@@ -1581,6 +1582,9 @@ namespace DuvcApi
             _timer.Tick += (sender, args) => UpdateStatus();
             _timer.Start();
             UpdateStatus();
+
+            _updater = new AutoUpdater();
+            _updater.Start();
         }
 
         public static void Run(bool startServer)
@@ -1667,6 +1671,10 @@ namespace DuvcApi
 
         protected override void ExitThreadCore()
         {
+            if (_updater != null)
+            {
+                _updater.Stop();
+            }
             _timer.Stop();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
@@ -2135,6 +2143,252 @@ namespace DuvcApi
             {
                 handler(line);
             }
+        }
+    }
+
+    internal sealed class AutoUpdater
+    {
+        private const string ReleasesUrl = "https://api.github.com/repos/eriksp/duvc-api/releases/latest";
+        private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+        private System.Threading.Timer _timer;
+        private volatile bool _updating;
+        private readonly string _currentVersion;
+        private readonly string _exePath;
+
+        public AutoUpdater()
+        {
+            _currentVersion = Program.GetVersionLabel().TrimStart('v');
+            _exePath = Process.GetCurrentProcess().MainModule.FileName;
+        }
+
+        public void Start()
+        {
+            var minutes = GetIntervalMinutes();
+            if (minutes <= 0)
+            {
+                Logger.Info("Auto-update disabled.");
+                return;
+            }
+
+            var interval = TimeSpan.FromMinutes(minutes);
+            _timer = new System.Threading.Timer(OnCheck, null, TimeSpan.FromSeconds(60), interval);
+            Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                "Auto-update enabled, checking every {0} minutes.", minutes));
+        }
+
+        public void Stop()
+        {
+            if (_timer != null)
+            {
+                _timer.Dispose();
+                _timer = null;
+            }
+        }
+
+        private static int GetIntervalMinutes()
+        {
+            var env = Environment.GetEnvironmentVariable("DUVC_API_UPDATE_INTERVAL");
+            int minutes;
+            if (int.TryParse(env, NumberStyles.Integer, CultureInfo.InvariantCulture, out minutes))
+            {
+                return minutes;
+            }
+            return 60;
+        }
+
+        private void OnCheck(object state)
+        {
+            if (_updating) return;
+            _updating = true;
+
+            try
+            {
+                CheckAndApply();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Update check failed: " + ex.Message);
+            }
+            finally
+            {
+                _updating = false;
+            }
+        }
+
+        private void CheckAndApply()
+        {
+            string tagName;
+            string exeUrl;
+            string sha256Url;
+            if (!FetchLatestRelease(out tagName, out exeUrl, out sha256Url))
+            {
+                return;
+            }
+
+            var latestVersion = tagName.TrimStart('v');
+            if (!IsNewer(latestVersion, _currentVersion))
+            {
+                return;
+            }
+
+            Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                "Update available: v{0} -> v{1}", _currentVersion, latestVersion));
+
+            if (string.IsNullOrEmpty(exeUrl))
+            {
+                Logger.Error("Release has no duvc-api.exe asset.");
+                return;
+            }
+
+            var updatePath = Path.Combine(Path.GetDirectoryName(_exePath), "duvc-api.update.exe");
+
+            DownloadFile(exeUrl, updatePath);
+
+            if (!string.IsNullOrEmpty(sha256Url))
+            {
+                var expectedHash = DownloadString(sha256Url).Trim().Split(' ')[0];
+                var actualHash = ComputeSha256(updatePath);
+                if (!string.Equals(expectedHash, actualHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    Logger.Error(string.Format(CultureInfo.InvariantCulture,
+                        "SHA256 mismatch: expected {0}, got {1}", expectedHash, actualHash));
+                    try { File.Delete(updatePath); }
+                    catch { }
+                    return;
+                }
+                Logger.Info("Update SHA256 verified.");
+            }
+
+            ApplyUpdate(updatePath);
+        }
+
+        private bool FetchLatestRelease(out string tagName, out string exeUrl, out string sha256Url)
+        {
+            tagName = null;
+            exeUrl = null;
+            sha256Url = null;
+
+            try
+            {
+                var request = (HttpWebRequest)WebRequest.Create(ReleasesUrl);
+                request.Method = "GET";
+                request.Timeout = 15000;
+                request.UserAgent = "duvc-api/" + _currentVersion;
+
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream()))
+                {
+                    var body = reader.ReadToEnd();
+                    var data = Json.Deserialize<Dictionary<string, object>>(body);
+                    if (data == null) return false;
+
+                    if (data.ContainsKey("tag_name"))
+                    {
+                        tagName = data["tag_name"].ToString();
+                    }
+
+                    var assetsObj = data.ContainsKey("assets") ? data["assets"] as ArrayList : null;
+                    if (assetsObj != null)
+                    {
+                        foreach (var item in assetsObj)
+                        {
+                            var asset = item as Dictionary<string, object>;
+                            if (asset == null) continue;
+
+                            var name = asset.ContainsKey("name") ? asset["name"].ToString() : "";
+                            var url = asset.ContainsKey("browser_download_url")
+                                ? asset["browser_download_url"].ToString() : "";
+
+                            if (string.Equals(name, "duvc-api.exe", StringComparison.OrdinalIgnoreCase))
+                                exeUrl = url;
+                            else if (string.Equals(name, "duvc-api.exe.sha256", StringComparison.OrdinalIgnoreCase))
+                                sha256Url = url;
+                        }
+                    }
+
+                    return !string.IsNullOrEmpty(tagName);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Failed to fetch release info: " + ex.Message);
+                return false;
+            }
+        }
+
+        private static bool IsNewer(string latest, string current)
+        {
+            Version latestVer, currentVer;
+            if (Version.TryParse(latest, out latestVer) && Version.TryParse(current, out currentVer))
+            {
+                return latestVer > currentVer;
+            }
+            return false;
+        }
+
+        private static void DownloadFile(string url, string targetPath)
+        {
+            var request = (HttpWebRequest)WebRequest.Create(url);
+            request.Timeout = 120000;
+            request.UserAgent = "duvc-api";
+
+            using (var response = (HttpWebResponse)request.GetResponse())
+            using (var stream = response.GetResponseStream())
+            using (var file = File.Create(targetPath))
+            {
+                stream.CopyTo(file);
+            }
+        }
+
+        private static string DownloadString(string url)
+        {
+            var request = (HttpWebRequest)WebRequest.Create(url);
+            request.Timeout = 15000;
+            request.UserAgent = "duvc-api";
+
+            using (var response = (HttpWebResponse)request.GetResponse())
+            using (var reader = new StreamReader(response.GetResponseStream()))
+            {
+                return reader.ReadToEnd();
+            }
+        }
+
+        private static string ComputeSha256(string filePath)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            using (var stream = File.OpenRead(filePath))
+            {
+                var hash = sha.ComputeHash(stream);
+                var sb = new StringBuilder(hash.Length * 2);
+                foreach (var b in hash)
+                {
+                    sb.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+                }
+                return sb.ToString();
+            }
+        }
+
+        private void ApplyUpdate(string updatePath)
+        {
+            var batchPath = Path.Combine(Path.GetTempPath(), "duvc-api-update.cmd");
+
+            var script = string.Format(CultureInfo.InvariantCulture,
+                "@echo off\r\n:retry\r\ntimeout /t 2 /nobreak >nul\r\nmove /Y \"{0}\" \"{1}\" >nul 2>&1\r\nif errorlevel 1 goto retry\r\nstart \"\" \"{1}\" app\r\ndel \"%~f0\"\r\n",
+                updatePath, _exePath);
+
+            File.WriteAllText(batchPath, script, Encoding.ASCII);
+
+            Logger.Info("Applying update, restarting...");
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = "/c \"" + batchPath + "\"",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                WindowStyle = ProcessWindowStyle.Hidden
+            });
+
+            Application.Exit();
         }
     }
 
