@@ -31,6 +31,9 @@ namespace DuvcApi
         [STAThread]
         public static int Main(string[] args)
         {
+            // .NET Framework 4.x defaults to TLS 1.0; GitHub API requires TLS 1.2
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+
             if (args.Length > 0)
             {
                 var command = args[0].Trim().ToLowerInvariant();
@@ -2228,6 +2231,8 @@ namespace DuvcApi
             var latestVersion = tagName.TrimStart('v');
             if (!IsNewer(latestVersion, _currentVersion))
             {
+                Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                    "Up to date (v{0}).", _currentVersion));
                 return;
             }
 
