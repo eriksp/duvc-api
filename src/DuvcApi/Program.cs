@@ -1604,12 +1604,43 @@ namespace DuvcApi
             {
                 if (!silent)
                 {
-                    MessageBox.Show("Another instance is already running.",
-                        Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    var result = MessageBox.Show(
+                        "Another instance is already running. Stop it and start a new one?",
+                        Program.AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    if (result == DialogResult.Yes)
+                    {
+                        KillOtherInstances();
+                        app = new TrayApp(startServer);
+                        if (InstanceGuard.IsOwner)
+                        {
+                            Application.Run(app);
+                        }
+                    }
                 }
                 return;
             }
             Application.Run(app);
+        }
+
+        private static void KillOtherInstances()
+        {
+            var currentPid = Process.GetCurrentProcess().Id;
+            var myName = Process.GetCurrentProcess().ProcessName;
+            foreach (var proc in Process.GetProcessesByName(myName))
+            {
+                if (proc.Id != currentPid)
+                {
+                    try
+                    {
+                        proc.Kill();
+                        proc.WaitForExit(5000);
+                    }
+                    catch { }
+                }
+                proc.Dispose();
+            }
+            // Wait for mutex to be released
+            Thread.Sleep(1000);
         }
 
         private void UpdateStatus()
