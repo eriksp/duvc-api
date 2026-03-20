@@ -47,13 +47,13 @@ namespace DuvcApi
                         ServiceBaseHost.Run(ServiceNameConst, ServiceDisplayName);
                         return 0;
                     case "tray":
-                        TrayApp.Run(false);
+                        TrayApp.Run(false, true);
                         return 0;
                     case "run":
                         ConsoleHost.Run();
                         return 0;
                     case "app":
-                        TrayApp.Run(true);
+                        TrayApp.Run(true, true);
                         return 0;
                     case "log":
                         LogApp.Run();
@@ -66,7 +66,7 @@ namespace DuvcApi
 
             if (Environment.UserInteractive)
             {
-                TrayApp.Run(true);
+                TrayApp.Run(true, false);
                 return 0;
             }
 
@@ -124,7 +124,7 @@ namespace DuvcApi
                 server.Start();
                 Logger.Info("API started in console mode.");
 
-                var trayThread = new Thread(() => TrayApp.Run(false))
+                var trayThread = new Thread(() => TrayApp.Run(false, true))
                 {
                     IsBackground = true,
                     Name = "DuvcApiTray"
@@ -1595,15 +1595,18 @@ namespace DuvcApi
             _updater.Start();
         }
 
-        public static void Run(bool startServer)
+        public static void Run(bool startServer, bool silent)
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             var app = new TrayApp(startServer);
             if (!InstanceGuard.IsOwner)
             {
-                MessageBox.Show("Another instance is already running.",
-                    Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                if (!silent)
+                {
+                    MessageBox.Show("Another instance is already running.",
+                        Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
                 return;
             }
             Application.Run(app);
