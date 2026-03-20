@@ -1586,6 +1586,11 @@ namespace DuvcApi
             _timer.Start();
             UpdateStatus();
 
+            _notifyIcon.BalloonTipTitle = Program.AppTitle;
+            _notifyIcon.BalloonTipText = string.Format(CultureInfo.InvariantCulture,
+                "Camera API running on port {0}", Program.GetPort());
+            _notifyIcon.ShowBalloonTip(3000);
+
             _updater = new AutoUpdater();
             _updater.Start();
         }
@@ -1597,6 +1602,8 @@ namespace DuvcApi
             var app = new TrayApp(startServer);
             if (!InstanceGuard.IsOwner)
             {
+                MessageBox.Show("Another instance is already running.",
+                    Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             Application.Run(app);
