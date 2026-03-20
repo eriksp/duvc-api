@@ -1387,7 +1387,7 @@ namespace DuvcApi
         {
             var taskCommand = string.Format(CultureInfo.InvariantCulture, "\"{0}\" app", exePath);
             RunSchtasks(string.Format(CultureInfo.InvariantCulture,
-                "/Create /F /SC ONLOGON /RL HIGHEST /RU \"INTERACTIVE\" /TN \"{0}\" /TR \"{1}\"",
+                "/Create /F /SC ONLOGON /RL LIMITED /RU \"INTERACTIVE\" /TN \"{0}\" /TR \"{1}\"",
                 TrayTaskName,
                 taskCommand));
         }
