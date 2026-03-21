@@ -940,25 +940,46 @@ namespace DuvcApi
 
     internal static class CorsHelper
     {
+        private static readonly string[] DefaultOrigins = new[]
+        {
+            "http://localhost", "https://localhost",
+            "http://127.0.0.1", "https://127.0.0.1"
+        };
+
         public static string GetAllowedOrigin(string origin)
         {
-            var configured = Environment.GetEnvironmentVariable("DUVC_API_ALLOWED_ORIGINS");
-            if (string.IsNullOrWhiteSpace(configured))
+            if (string.IsNullOrWhiteSpace(origin))
             {
-                return "*";
+                return string.Empty;
             }
 
-            var parts = configured.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-            foreach (var part in parts)
+            var configured = Environment.GetEnvironmentVariable("DUVC_API_ALLOWED_ORIGINS");
+
+            // Use configured origins if set, otherwise allow localhost only
+            var allowed = string.IsNullOrWhiteSpace(configured) ? DefaultOrigins : ParseOrigins(configured);
+
+            foreach (var entry in allowed)
             {
-                var trimmed = part.Trim();
-                if (string.Equals(trimmed, origin, StringComparison.OrdinalIgnoreCase))
+                // Match origin or origin with port (e.g. http://localhost:5173)
+                if (string.Equals(entry, origin, StringComparison.OrdinalIgnoreCase)
+                    || (origin.StartsWith(entry + ":", StringComparison.OrdinalIgnoreCase)
+                        && origin.IndexOf(':', entry.Length + 1) < 0))
                 {
                     return origin;
                 }
             }
 
             return string.Empty;
+        }
+
+        private static string[] ParseOrigins(string configured)
+        {
+            var parts = configured.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                parts[i] = parts[i].Trim();
+            }
+            return parts;
         }
     }
 
@@ -1016,6 +1037,26 @@ namespace DuvcApi
     internal static class DuvcCli
     {
         private static readonly Regex DeviceRegex = new Regex("^\\[(\\d+)\\]\\s+(.+)$", RegexOptions.Compiled);
+        private static readonly Regex SafeArgRegex = new Regex("^[a-zA-Z0-9_\\-\\.]+$", RegexOptions.Compiled);
+        private static readonly Regex SafeValueRegex = new Regex("^[a-zA-Z0-9_\\-\\.,]+$", RegexOptions.Compiled);
+
+        private static void ValidateArg(string value, string name)
+        {
+            if (!SafeArgRegex.IsMatch(value))
+            {
+                throw new ArgumentException(string.Format(CultureInfo.InvariantCulture,
+                    "{0} contains invalid characters.", name));
+            }
+        }
+
+        private static void ValidateValue(string value, string name)
+        {
+            if (!SafeValueRegex.IsMatch(value))
+            {
+                throw new ArgumentException(string.Format(CultureInfo.InvariantCulture,
+                    "{0} contains invalid characters.", name));
+            }
+        }
 
         public static List<CameraDevice> ListDevices()
         {
@@ -1072,6 +1113,9 @@ namespace DuvcApi
                 throw new ArgumentException("domain and property are required.");
             }
 
+            ValidateArg(request.domain, "domain");
+            ValidateArg(request.property, "property");
+
             var builder = new StringBuilder();
             if (request.relative)
             {
@@ -1088,9 +1132,11 @@ namespace DuvcApi
 
             if (!string.IsNullOrWhiteSpace(request.value))
             {
+                ValidateValue(request.value, "value");
                 builder.Append(request.value);
                 if (!string.IsNullOrWhiteSpace(request.mode))
                 {
+                    ValidateArg(request.mode, "mode");
                     builder.Append(' ').Append(request.mode);
                 }
                 return builder.ToString().Trim();
@@ -1098,6 +1144,7 @@ namespace DuvcApi
 
             if (!string.IsNullOrWhiteSpace(request.mode))
             {
+                ValidateArg(request.mode, "mode");
                 builder.Append(request.mode);
                 return builder.ToString().Trim();
             }
@@ -1110,6 +1157,12 @@ namespace DuvcApi
             if (string.IsNullOrWhiteSpace(request.domain) || request.properties == null || request.properties.Length == 0)
             {
                 throw new ArgumentException("domain and properties are required.");
+            }
+
+            ValidateArg(request.domain, "domain");
+            foreach (var prop in request.properties)
+            {
+                ValidateArg(prop, "property");
             }
 
             var props = string.Join(",", request.properties);
@@ -1137,6 +1190,9 @@ namespace DuvcApi
             {
                 throw new ArgumentException("domain and property are required when all=false.");
             }
+
+            ValidateArg(request.domain, "domain");
+            ValidateArg(request.property, "property");
 
             return string.Format(CultureInfo.InvariantCulture, "reset {0} {1} {2}", index, request.domain, request.property);
         }
