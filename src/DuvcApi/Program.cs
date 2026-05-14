@@ -2304,122 +2304,162 @@ namespace DuvcApi
         }
     }
 
+    internal static class Paths
+    {
+        // Users-writable state directory created by `install`. Holds the update
+        // request file (IPC) plus the existing log/settings files.
+        public static string StateDir
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                    "DuvcApi");
+            }
+        }
+
+        public static string RequestFile { get { return Path.Combine(StateDir, "update.request"); } }
+
+        public static string CurrentExe { get { return Process.GetCurrentProcess().MainModule.FileName; } }
+
+        public static string BackupExe(string exePath)
+        {
+            return Path.Combine(Path.GetDirectoryName(exePath), "duvc-api.bak.exe");
+        }
+
+        // The running exe is renamed here during a service-driven update so the new
+        // exe can take the canonical path while this process keeps running.
+        public static string OldExe(string exePath)
+        {
+            return Path.Combine(Path.GetDirectoryName(exePath), "duvc-api.old.exe");
+        }
+
+        public static string SiblingCli(string exePath)
+        {
+            return Path.Combine(Path.GetDirectoryName(exePath), "duvc-cli.exe");
+        }
+    }
+
+    internal sealed class UpdateInfo
+    {
+        public string Version { get; set; }
+        public string ExeUrl { get; set; }
+        public string Sha256Url { get; set; }
+    }
+
     internal sealed class AutoUpdater
     {
         private const string ReleasesUrl = "https://api.github.com/repos/eriksp/duvc-api/releases/latest";
         private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
-        private System.Threading.Timer _timer;
-        private volatile bool _updating;
         private readonly string _currentVersion;
-        private readonly string _exePath;
 
         public AutoUpdater()
         {
             _currentVersion = Program.GetVersionLabel().TrimStart('v');
-            _exePath = Process.GetCurrentProcess().MainModule.FileName;
         }
 
-        public void Start()
+        // Last result of CheckForUpdate(): non-null when a newer release exists.
+        public UpdateInfo AvailableUpdate { get; private set; }
+
+        // Queries releases/latest. Returns an UpdateInfo when a newer version with a
+        // duvc-api.exe asset exists, otherwise null. Never throws; caches the result.
+        public UpdateInfo CheckForUpdate()
         {
-            var minutes = GetIntervalMinutes();
-            if (minutes <= 0)
-            {
-                Logger.Info("Auto-update disabled.");
-                return;
-            }
-
-            var interval = TimeSpan.FromMinutes(minutes);
-            _timer = new System.Threading.Timer(OnCheck, null, TimeSpan.FromSeconds(60), interval);
-            Logger.Info(string.Format(CultureInfo.InvariantCulture,
-                "Auto-update enabled, checking every {0} minutes.", minutes));
-        }
-
-        public void Stop()
-        {
-            if (_timer != null)
-            {
-                _timer.Dispose();
-                _timer = null;
-            }
-        }
-
-        private static int GetIntervalMinutes()
-        {
-            var env = Environment.GetEnvironmentVariable("DUVC_API_UPDATE_INTERVAL");
-            int minutes;
-            if (int.TryParse(env, NumberStyles.Integer, CultureInfo.InvariantCulture, out minutes))
-            {
-                return minutes;
-            }
-            return 60;
-        }
-
-        private void OnCheck(object state)
-        {
-            if (_updating) return;
-            _updating = true;
-
             try
             {
-                CheckAndApply();
+                string tagName, exeUrl, sha256Url;
+                if (!FetchLatestRelease(out tagName, out exeUrl, out sha256Url))
+                {
+                    return AvailableUpdate;
+                }
+
+                var latestVersion = tagName.TrimStart('v');
+                if (!IsNewer(latestVersion, _currentVersion) || string.IsNullOrEmpty(exeUrl))
+                {
+                    AvailableUpdate = null;
+                    return null;
+                }
+
+                AvailableUpdate = new UpdateInfo
+                {
+                    Version = latestVersion,
+                    ExeUrl = exeUrl,
+                    Sha256Url = sha256Url
+                };
+                Logger.Info(string.Format(CultureInfo.InvariantCulture,
+                    "Update available: v{0} -> v{1}", _currentVersion, latestVersion));
+                return AvailableUpdate;
             }
             catch (Exception ex)
             {
                 Logger.Error("Update check failed: " + ex.Message);
-            }
-            finally
-            {
-                _updating = false;
+                return AvailableUpdate;
             }
         }
 
-        private void CheckAndApply()
+        // Downloads the update exe and verifies its SHA-256. Returns the temp path of
+        // the verified exe, or null on any failure. Never throws.
+        public string DownloadAndVerify(UpdateInfo info)
         {
-            string tagName;
-            string exeUrl;
-            string sha256Url;
-            if (!FetchLatestRelease(out tagName, out exeUrl, out sha256Url))
+            if (info == null || string.IsNullOrEmpty(info.ExeUrl)) return null;
+
+            var tempPath = Path.Combine(Path.GetTempPath(),
+                "duvc-api.update." + Guid.NewGuid().ToString("N") + ".exe");
+            try
             {
-                return;
-            }
+                DownloadFile(info.ExeUrl, tempPath);
 
-            var latestVersion = tagName.TrimStart('v');
-            if (!IsNewer(latestVersion, _currentVersion))
-            {
-                Logger.Info(string.Format(CultureInfo.InvariantCulture,
-                    "Up to date (v{0}).", _currentVersion));
-                return;
-            }
-
-            Logger.Info(string.Format(CultureInfo.InvariantCulture,
-                "Update available: v{0} -> v{1}", _currentVersion, latestVersion));
-
-            if (string.IsNullOrEmpty(exeUrl))
-            {
-                Logger.Error("Release has no duvc-api.exe asset.");
-                return;
-            }
-
-            var updatePath = Path.Combine(Path.GetDirectoryName(_exePath), "duvc-api.update.exe");
-
-            DownloadFile(exeUrl, updatePath);
-
-            if (!string.IsNullOrEmpty(sha256Url))
-            {
-                var expectedHash = DownloadString(sha256Url).Trim().Split(' ')[0];
-                var actualHash = ComputeSha256(updatePath);
-                if (!string.Equals(expectedHash, actualHash, StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrEmpty(info.Sha256Url))
                 {
-                    Logger.Error(string.Format(CultureInfo.InvariantCulture,
-                        "SHA256 mismatch: expected {0}, got {1}", expectedHash, actualHash));
-                    try { File.Delete(updatePath); }
-                    catch { }
-                    return;
+                    var expected = DownloadString(info.Sha256Url).Trim().Split(' ')[0];
+                    var actual = ComputeSha256(tempPath);
+                    if (!string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Logger.Error(string.Format(CultureInfo.InvariantCulture,
+                            "SHA256 mismatch: expected {0}, got {1}", expected, actual));
+                        TryDelete(tempPath);
+                        return null;
+                    }
+                    Logger.Info("Update SHA256 verified.");
                 }
-                Logger.Info("Update SHA256 verified.");
-            }
 
-            ApplyUpdate(updatePath);
+                return tempPath;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Update download failed: " + ex.Message);
+                TryDelete(tempPath);
+                return null;
+            }
+        }
+
+        // Standalone (no service installed): swap via a temp .cmd that waits for this
+        // process to exit, moves the verified exe into place, drops the sibling
+        // duvc-cli.exe so it re-extracts, and restarts "app".
+        public void ApplyInProcess(string verifiedExePath)
+        {
+            var exePath = Paths.CurrentExe;
+            var batchPath = Path.Combine(Path.GetTempPath(), "duvc-api-update.cmd");
+
+            var script = string.Format(CultureInfo.InvariantCulture,
+                "@echo off\r\n:retry\r\ntimeout /t 2 /nobreak >nul\r\n" +
+                "move /Y \"{0}\" \"{1}\" >nul 2>&1\r\nif errorlevel 1 goto retry\r\n" +
+                "del \"{2}\" >nul 2>&1\r\nstart \"\" \"{1}\" app\r\ndel \"%~f0\"\r\n",
+                verifiedExePath, exePath, Paths.SiblingCli(exePath));
+
+            File.WriteAllText(batchPath, script, Encoding.ASCII);
+
+            Logger.Info("Applying update, restarting...");
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = "/c \"" + batchPath + "\"",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                WindowStyle = ProcessWindowStyle.Hidden
+            });
+
+            Application.Exit();
         }
 
         private bool FetchLatestRelease(out string tagName, out string exeUrl, out string sha256Url)
@@ -2528,27 +2568,10 @@ namespace DuvcApi
             }
         }
 
-        private void ApplyUpdate(string updatePath)
+        private static void TryDelete(string path)
         {
-            var batchPath = Path.Combine(Path.GetTempPath(), "duvc-api-update.cmd");
-
-            var script = string.Format(CultureInfo.InvariantCulture,
-                "@echo off\r\n:retry\r\ntimeout /t 2 /nobreak >nul\r\nmove /Y \"{0}\" \"{1}\" >nul 2>&1\r\nif errorlevel 1 goto retry\r\nstart \"\" \"{1}\" app\r\ndel \"%~f0\"\r\n",
-                updatePath, _exePath);
-
-            File.WriteAllText(batchPath, script, Encoding.ASCII);
-
-            Logger.Info("Applying update, restarting...");
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = "/c \"" + batchPath + "\"",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                WindowStyle = ProcessWindowStyle.Hidden
-            });
-
-            Application.Exit();
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch { }
         }
     }
 
