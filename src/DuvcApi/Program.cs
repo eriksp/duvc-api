@@ -6,6 +6,7 @@ using System.Drawing;
 using System.Globalization;
 using System.ComponentModel;
 using System.IO;
+using Microsoft.Win32;
 using System.Net;
 using System.Net.WebSockets;
 using System.Reflection;
@@ -197,6 +198,9 @@ namespace DuvcApi
         private readonly WebSocketHub _webSockets = new WebSocketHub();
         private System.Threading.Timer _statusTimer;
         private int _statusBusy;
+        private volatile StatusPayload _cachedStatus;
+        private long _cachedStatusTicks;
+        private const long CachedStatusMaxAgeMs = 5000;
 
         public ApiServer(int port, string cameraName)
         {
@@ -304,10 +308,13 @@ namespace DuvcApi
                     }
                 }
 
-                Logger.Info(string.Format(CultureInfo.InvariantCulture, "{0} {1} {2}",
-                    request.HttpMethod,
-                    path,
-                    string.IsNullOrWhiteSpace(bodyText) ? string.Empty : bodyText));
+                if (ShouldLogRequest(request.HttpMethod, path))
+                {
+                    Logger.Info(string.Format(CultureInfo.InvariantCulture, "{0} {1} {2}",
+                        request.HttpMethod,
+                        path,
+                        string.IsNullOrWhiteSpace(bodyText) ? string.Empty : bodyText));
+                }
 
                 if (path.Equals("/health", StringComparison.OrdinalIgnoreCase) && request.HttpMethod == "GET")
                 {
@@ -515,9 +522,22 @@ namespace DuvcApi
             }
         }
 
+        private static bool ShouldLogRequest(string method, string path)
+        {
+            if (string.Equals(method, "OPTIONS", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            return !path.Equals("/health", StringComparison.OrdinalIgnoreCase)
+                && !path.Equals("/status", StringComparison.OrdinalIgnoreCase);
+        }
+
         private void HandleStatus(HttpListenerResponse response)
         {
-            var payload = BuildStatusPayload();
+            var cached = _cachedStatus;
+            var cachedTicks = Interlocked.Read(ref _cachedStatusTicks);
+            var ageMs = (DateTime.UtcNow.Ticks - cachedTicks) / TimeSpan.TicksPerMillisecond;
+            var payload = (cached != null && ageMs < CachedStatusMaxAgeMs) ? cached : BuildStatusPayload();
             var statusCode = payload.ok ? (payload.cameraFound ? 200 : 503) : 503;
             WriteJson(response, statusCode, payload);
         }
@@ -736,12 +756,13 @@ namespace DuvcApi
 
         private StatusPayload BuildStatusPayload()
         {
+            StatusPayload payload;
             try
             {
                 var devices = DuvcCli.ListDevices(false);
                 var index = DuvcCli.FindDeviceIndex(devices, _cameraName);
                 var cameraFound = index.HasValue;
-                return new StatusPayload
+                payload = new StatusPayload
                 {
                     type = "status",
                     ok = true,
@@ -757,7 +778,7 @@ namespace DuvcApi
             }
             catch (Exception ex)
             {
-                return new StatusPayload
+                payload = new StatusPayload
                 {
                     type = "status",
                     ok = false,
@@ -771,10 +792,21 @@ namespace DuvcApi
                     error = ex.Message
                 };
             }
+
+            _cachedStatus = payload;
+            Interlocked.Exchange(ref _cachedStatusTicks, DateTime.UtcNow.Ticks);
+            return payload;
         }
 
         private void BroadcastStatus(object state)
         {
+            // Skip the periodic duvc-cli enumeration entirely when no one is listening.
+            // /status falls back to BuildStatusPayload on demand (with a 5s cache).
+            if (_webSockets.ClientCount == 0)
+            {
+                return;
+            }
+
             if (Interlocked.Exchange(ref _statusBusy, 1) == 1)
             {
                 return;
@@ -943,7 +975,8 @@ namespace DuvcApi
         private static readonly string[] DefaultOrigins = new[]
         {
             "http://localhost", "https://localhost",
-            "http://127.0.0.1", "https://127.0.0.1"
+            "http://127.0.0.1", "https://127.0.0.1",
+            "https://colpo.cellari.io", "https://colpo-staging.cellari.io"
         };
 
         public static string GetAllowedOrigin(string origin)
@@ -1247,7 +1280,9 @@ namespace DuvcApi
                 {
                     Logger.Error(stderr.Trim());
                 }
-                if (log && !string.IsNullOrWhiteSpace(stdout))
+                // Skip stdout logging on success — the body is returned to the caller anyway
+                // and writing it to disk per request is the main I/O cost on busy frontends.
+                if (log && process.ExitCode != 0 && !string.IsNullOrWhiteSpace(stdout))
                 {
                     Logger.Info(stdout.Trim());
                 }
@@ -1355,6 +1390,8 @@ namespace DuvcApi
     internal static class ServiceInstaller
     {
         private const string TrayTaskName = "CellariCameraControlTray";
+        private const string RunRegistryPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+        private const string RunValueName = "CellariCameraControl";
 
         public static int Install(string serviceName, string displayName)
         {
@@ -1441,16 +1478,63 @@ namespace DuvcApi
 
         private static void InstallAppTask(string exePath)
         {
-            var taskCommand = string.Format(CultureInfo.InvariantCulture, "\"{0}\" app", exePath);
-            RunSchtasks(string.Format(CultureInfo.InvariantCulture,
-                "/Create /F /SC ONLOGON /RL LIMITED /RU \"INTERACTIVE\" /TN \"{0}\" /TR \"{1}\"",
-                TrayTaskName,
-                taskCommand));
+            // HKLM\...\Run fires for any user logon (incl. kiosk auto-logon),
+            // runs as the logging-on user, and avoids schtasks principal/trigger
+            // issues seen with /SC ONLOGON /RU INTERACTIVE on locked-down kiosks.
+            var command = string.Format(CultureInfo.InvariantCulture, "\"{0}\" app", exePath);
+            using (var key = Registry.LocalMachine.CreateSubKey(RunRegistryPath))
+            {
+                key.SetValue(RunValueName, command, RegistryValueKind.String);
+            }
+
+            RemoveLegacyScheduledTask();
         }
 
         private static void UninstallAppTask()
         {
-            RunSchtasks(string.Format(CultureInfo.InvariantCulture, "/Delete /F /TN \"{0}\"", TrayTaskName));
+            try
+            {
+                using (var key = Registry.LocalMachine.OpenSubKey(RunRegistryPath, writable: true))
+                {
+                    if (key != null && key.GetValue(RunValueName) != null)
+                    {
+                        key.DeleteValue(RunValueName, throwOnMissingValue: false);
+                    }
+                }
+            }
+            catch
+            {
+                // ignore registry cleanup errors
+            }
+
+            RemoveLegacyScheduledTask();
+        }
+
+        private static void RemoveLegacyScheduledTask()
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "schtasks.exe",
+                Arguments = string.Format(CultureInfo.InvariantCulture, "/Delete /F /TN \"{0}\"", TrayTaskName),
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            try
+            {
+                using (var process = Process.Start(startInfo))
+                {
+                    process.StandardOutput.ReadToEnd();
+                    process.StandardError.ReadToEnd();
+                    process.WaitForExit(10000);
+                }
+            }
+            catch
+            {
+                // ignore cleanup failures (task may not exist)
+            }
         }
 
         private static void TryStartAppNow(string exePath)
@@ -1475,34 +1559,6 @@ namespace DuvcApi
             catch
             {
                 // ignore app start errors
-            }
-        }
-
-        private static int RunSchtasks(string arguments)
-        {
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = "schtasks.exe",
-                Arguments = arguments,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-
-            using (var process = Process.Start(startInfo))
-            {
-                var stdout = process.StandardOutput.ReadToEnd();
-                var stderr = process.StandardError.ReadToEnd();
-                process.WaitForExit(10000);
-
-                if (process.ExitCode != 0)
-                {
-                    Console.Error.WriteLine(stdout);
-                    Console.Error.WriteLine(stderr);
-                }
-
-                return process.ExitCode;
             }
         }
 
