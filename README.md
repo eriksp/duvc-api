@@ -349,8 +349,8 @@ with parallel execution, and guidance on sequential vs parallel property tuning.
 ## Notes
 
 - The API only listens on `127.0.0.1` for safety.
-- `duvc-cli.exe` is embedded in `duvc-api.exe` and extracted to
-  `%ProgramData%\DuvcApi\duvc-cli.exe` at runtime.
+- `duvc-cli.exe` is embedded in `duvc-api.exe` and extracted next to it
+  at runtime (the same folder as `duvc-api.exe`, e.g. `C:\Kiosk`).
 - The tray menu includes **Show Log** for a real-time API/cli log window,
   with a small command panel that can send REST or WebSocket camera commands.
 - The tray menu also includes **Install Camera API as Service** and **Uninstall Camera API Service**,
