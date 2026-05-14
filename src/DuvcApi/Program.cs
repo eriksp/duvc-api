@@ -1304,7 +1304,9 @@ namespace DuvcApi
                 return configured;
             }
 
-            var baseDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DuvcApi");
+            // Extract duvc-cli.exe next to the running duvc-api.exe so both
+            // files stay together (e.g. C:\Kiosk on a kiosk install).
+            var baseDir = Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName);
             var exePath = Path.Combine(baseDir, "duvc-cli.exe");
 
             if (!File.Exists(exePath))
