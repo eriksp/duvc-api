@@ -1626,27 +1626,29 @@ namespace DuvcApi
             var exePath = Process.GetCurrentProcess().MainModule.FileName;
             var port = Program.GetPort();
 
-            // Register URL ACL so non-admin kiosk users can bind HttpListener
+            // Register URL ACL so the non-admin kiosk user can bind HttpListener.
             RegisterUrlAcl(port);
+
+            // Create the Users-writable state directory used for logs/settings and the
+            // update-request IPC file.
+            EnsureStateDir();
 
             var status = ServiceStatusHelper.GetStatus(serviceName);
             if (status.IsInstalled)
             {
-                // Upgrade: stop the running service and switch to demand start
-                // so the scheduled task owns the API lifecycle (avoids port conflict)
                 if (status.IsRunning)
                 {
                     RunSc(string.Format(CultureInfo.InvariantCulture, "stop {0}", serviceName));
                 }
                 RunSc(string.Format(CultureInfo.InvariantCulture,
-                    "config {0} start= demand", serviceName));
+                    "config {0} start= auto", serviceName));
             }
             else
             {
                 var binPath = string.Format(CultureInfo.InvariantCulture, "\"{0}\" service", exePath);
 
                 var createResult = RunSc(string.Format(CultureInfo.InvariantCulture,
-                    "create {0} binPath= \"{1}\" start= demand DisplayName= \"{2}\"",
+                    "create {0} binPath= \"{1}\" start= auto DisplayName= \"{2}\"",
                     serviceName, binPath, displayName));
                 if (createResult != 0)
                 {
@@ -1654,24 +1656,28 @@ namespace DuvcApi
                 }
 
                 RunSc(string.Format(CultureInfo.InvariantCulture,
-                    "description {0} \"Local API for DUVC camera control\"", serviceName));
+                    "description {0} \"Cellari Camera Control API watchdog and updater\"", serviceName));
             }
 
-            // Auto-restart service on failure (5s, 10s, 30s delays)
+            // Auto-restart the service on failure (5s, 10s, 30s delays).
             ConfigureRecovery(serviceName);
 
-            // The API runs via scheduled task in the interactive user session (not the service)
-            // because Session 0 services cannot access DirectShow/UVC camera devices
-            InstallAppTask(exePath);
-            TryStartAppNow(exePath);
-            Console.WriteLine("Installed. API will start automatically on user logon.");
+            // The service is the watchdog: it launches and monitors "duvc-api.exe app"
+            // in the interactive session, so the legacy Run key is no longer used.
+            RemoveLegacyAppTask();
+
+            // Start the service now so provisioning does not require a reboot. The
+            // service's watchdog then launches the app in the active session.
+            RunSc(string.Format(CultureInfo.InvariantCulture, "start {0}", serviceName));
+
+            Console.WriteLine("Installed. The DuvcApi service will keep the API running and up to date.");
             return 0;
         }
 
         public static int Uninstall(string serviceName)
         {
             RunSc(string.Format(CultureInfo.InvariantCulture, "stop {0}", serviceName));
-            UninstallAppTask();
+            RemoveLegacyAppTask();
             RemoveUrlAcl(Program.GetPort());
             return RunSc(string.Format(CultureInfo.InvariantCulture, "delete {0}", serviceName));
         }
@@ -1704,21 +1710,43 @@ namespace DuvcApi
             }
         }
 
-        private static void InstallAppTask(string exePath)
+        private static void EnsureStateDir()
         {
-            // HKLM\...\Run fires for any user logon (incl. kiosk auto-logon),
-            // runs as the logging-on user, and avoids schtasks principal/trigger
-            // issues seen with /SC ONLOGON /RU INTERACTIVE on locked-down kiosks.
-            var command = string.Format(CultureInfo.InvariantCulture, "\"{0}\" app", exePath);
-            using (var key = Registry.LocalMachine.CreateSubKey(RunRegistryPath))
+            try
             {
-                key.SetValue(RunValueName, command, RegistryValueKind.String);
+                var dir = Paths.StateDir;
+                if (!Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                // Grant BUILTIN\Users Modify so the kiosk user can write update.request.
+                // S-1-5-32-545 = BUILTIN\Users (locale-independent).
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "icacls.exe",
+                    Arguments = string.Format(CultureInfo.InvariantCulture,
+                        "\"{0}\" /grant *S-1-5-32-545:(OI)(CI)M", dir),
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using (var p = Process.Start(psi))
+                {
+                    p.StandardOutput.ReadToEnd();
+                    p.StandardError.ReadToEnd();
+                    p.WaitForExit(10000);
+                }
             }
-
-            RemoveLegacyScheduledTask();
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("Failed to prepare state directory: " + ex.Message);
+            }
         }
 
-        private static void UninstallAppTask()
+        // Removes the legacy HKLM\...\Run value and the legacy scheduled task left by
+        // older installs. The service watchdog now owns the app lifecycle.
+        private static void RemoveLegacyAppTask()
         {
             try
             {
@@ -1762,31 +1790,6 @@ namespace DuvcApi
             catch
             {
                 // ignore cleanup failures (task may not exist)
-            }
-        }
-
-        private static void TryStartAppNow(string exePath)
-        {
-            try
-            {
-                if (Environment.UserInteractive)
-                {
-                    if (TrayInstanceGuard.IsTrayRunning())
-                    {
-                        return;
-                    }
-
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = exePath,
-                        Arguments = "app",
-                        UseShellExecute = true
-                    });
-                }
-            }
-            catch
-            {
-                // ignore app start errors
             }
         }
 
