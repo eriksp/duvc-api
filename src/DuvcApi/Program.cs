@@ -165,25 +165,237 @@ namespace DuvcApi
 
     internal sealed class DuvcApiService : ServiceBase
     {
-        private readonly ApiServer _server;
+        private const string AppProcessName = "duvc-api";
+        private static readonly TimeSpan WatchdogTick = TimeSpan.FromSeconds(10);
+
+        private Thread _worker;
+        private volatile bool _running;
+        private readonly AutoUpdater _updater = new AutoUpdater();
+        private DateTime _lastUpdateCheckUtc = DateTime.MinValue;
 
         public DuvcApiService(string serviceName, string displayName)
         {
             ServiceName = serviceName;
             CanStop = true;
             CanPauseAndContinue = false;
+            CanHandleSessionChangeEvent = true;
             AutoLog = true;
-            _server = new ApiServer(Program.GetPort(), Program.GetCameraName());
         }
 
         protected override void OnStart(string[] args)
         {
-            _server.Start();
+            // Clean up a leftover renamed exe from a previous update, if it is no
+            // longer locked.
+            TryDelete(Paths.OldExe(Paths.CurrentExe));
+
+            _running = true;
+            _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "DuvcApiWatchdog" };
+            _worker.Start();
         }
 
         protected override void OnStop()
         {
-            _server.Stop();
+            _running = false;
+            if (_worker != null)
+            {
+                _worker.Join(5000);
+            }
+        }
+
+        protected override void OnSessionChange(SessionChangeDescription change)
+        {
+            if (change.Reason == SessionChangeReason.SessionLogon ||
+                change.Reason == SessionChangeReason.ConsoleConnect ||
+                change.Reason == SessionChangeReason.SessionUnlock)
+            {
+                EnsureAppRunning();
+            }
+        }
+
+        private void WorkerLoop()
+        {
+            while (_running)
+            {
+                try
+                {
+                    EnsureAppRunning();
+
+                    if (File.Exists(Paths.RequestFile))
+                    {
+                        TryDelete(Paths.RequestFile);
+                        Logger.Info("Manual update request received.");
+                        RunUpdate();
+                    }
+                    else if (DateTime.UtcNow - _lastUpdateCheckUtc >= GetUpdateInterval())
+                    {
+                        _lastUpdateCheckUtc = DateTime.UtcNow;
+                        RunUpdate();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error("Watchdog loop error: " + ex.Message);
+                }
+
+                // Sleep WatchdogTick in 500 ms slices so OnStop is responsive.
+                for (int i = 0; i < WatchdogTick.TotalMilliseconds / 500 && _running; i++)
+                {
+                    Thread.Sleep(500);
+                }
+            }
+        }
+
+        // Launches "app" into the active console session if no instance is running
+        // there. Safe to call repeatedly.
+        private static void EnsureAppRunning()
+        {
+            try
+            {
+                if (SessionLauncher.IsRunningInActiveSession(AppProcessName))
+                {
+                    return;
+                }
+                if (SessionLauncher.TryLaunchInActiveSession(Paths.CurrentExe, "app"))
+                {
+                    Logger.Info("Watchdog launched app in the active session.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("EnsureAppRunning failed: " + ex.Message);
+            }
+        }
+
+        // Checks for an update and, if found, applies it as SYSTEM with backup and
+        // health-check rollback. Never throws.
+        private void RunUpdate()
+        {
+            try
+            {
+                var info = _updater.CheckForUpdate();
+                if (info == null)
+                {
+                    return;
+                }
+
+                var verified = _updater.DownloadAndVerify(info);
+                if (verified == null)
+                {
+                    return;
+                }
+
+                var exe = Paths.CurrentExe;
+                var backup = Paths.BackupExe(exe);
+                var old = Paths.OldExe(exe);
+                var cli = Paths.SiblingCli(exe);
+
+                // Back up the current canonical exe (copy from a running image is allowed).
+                File.Copy(exe, backup, true);
+
+                // Rename the running exe out of the way. Renaming a running image is
+                // allowed on Windows; the service and any app process keep running
+                // from the renamed file. This frees the canonical path.
+                TryDelete(old);
+                File.Move(exe, old);
+
+                // Place the new exe at the canonical path and drop the sibling CLI so
+                // the new exe re-extracts the (possibly updated) embedded duvc-cli.exe.
+                File.Copy(verified, exe, true);
+                TryDelete(cli);
+                TryDelete(verified);
+
+                // Restart the app from the new exe.
+                StopApp();
+                SessionLauncher.TryLaunchInActiveSession(exe, "app");
+                Logger.Info("Update applied: v" + info.Version);
+
+                // Rollback if the new version never reports healthy.
+                if (!WaitForHealthy(TimeSpan.FromSeconds(30)))
+                {
+                    Logger.Error("New version unhealthy; rolling back to backup.");
+                    StopApp();
+                    File.Copy(backup, exe, true);
+                    TryDelete(cli);
+                    SessionLauncher.TryLaunchInActiveSession(exe, "app");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Update failed: " + ex.Message);
+                // Best-effort recovery: if the canonical exe is missing/broken, restore
+                // the backup so the watchdog can relaunch something working.
+                try
+                {
+                    var exe = Paths.CurrentExe;
+                    var backup = Paths.BackupExe(exe);
+                    if (File.Exists(backup) && !File.Exists(exe))
+                    {
+                        File.Copy(backup, exe, true);
+                        SessionLauncher.TryLaunchInActiveSession(exe, "app");
+                    }
+                }
+                catch { }
+            }
+        }
+
+        // Kills every duvc-api process except this service process.
+        private static void StopApp()
+        {
+            var selfId = Process.GetCurrentProcess().Id;
+            foreach (var p in Process.GetProcessesByName(AppProcessName))
+            {
+                try
+                {
+                    if (p.Id == selfId) continue;
+                    p.Kill();
+                    p.WaitForExit(5000);
+                }
+                catch { }
+                finally { p.Dispose(); }
+            }
+        }
+
+        private static bool WaitForHealthy(TimeSpan timeout)
+        {
+            var url = string.Format(CultureInfo.InvariantCulture,
+                "http://127.0.0.1:{0}/health", Program.GetPort());
+            var deadline = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < deadline)
+            {
+                try
+                {
+                    var req = (HttpWebRequest)WebRequest.Create(url);
+                    req.Timeout = 3000;
+                    using (var resp = (HttpWebResponse)req.GetResponse())
+                    {
+                        if (resp.StatusCode == HttpStatusCode.OK)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                catch { }
+                Thread.Sleep(2000);
+            }
+            return false;
+        }
+
+        private static TimeSpan GetUpdateInterval()
+        {
+            var env = Environment.GetEnvironmentVariable("DUVC_API_UPDATE_INTERVAL");
+            int minutes;
+            if (int.TryParse(env, NumberStyles.Integer, CultureInfo.InvariantCulture, out minutes)
+                && minutes > 0)
+            {
+                return TimeSpan.FromMinutes(minutes);
+            }
+            return TimeSpan.FromMinutes(60);
+        }
+
+        private static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch { }
         }
     }
 
