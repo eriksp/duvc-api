@@ -1853,6 +1853,9 @@ namespace DuvcApi
         private ToolStripMenuItem _uninstallServiceItem;
         private Form _menuHost;
         private AutoUpdater _updater;
+        private ToolStripMenuItem _updateItem;
+        private System.Threading.Timer _updateCheckTimer;
+        private volatile bool _firstUpdateCheckDone;
 
         private TrayApp(bool startServer)
         {
@@ -1904,6 +1907,8 @@ namespace DuvcApi
             _installServiceItem.Click += (sender, args) => RunElevated("install");
             _uninstallServiceItem = new ToolStripMenuItem("Uninstall Camera API Service");
             _uninstallServiceItem.Click += (sender, args) => RunElevated("uninstall");
+            _updateItem = new ToolStripMenuItem("Checking for updates…") { Enabled = false };
+            _updateItem.Click += (sender, args) => OnUpdateClicked();
             var exit = new ToolStripMenuItem("Exit");
             exit.Click += (sender, args) => ExitThread();
             menu.Items.Add(appTitle);
@@ -1913,6 +1918,8 @@ namespace DuvcApi
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(_installServiceItem);
             menu.Items.Add(_uninstallServiceItem);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(_updateItem);
             menu.Items.Add(exit);
             _notifyIcon.ContextMenuStrip = menu;
             _notifyIcon.MouseUp += (sender, args) =>
@@ -1935,7 +1942,10 @@ namespace DuvcApi
             _notifyIcon.ShowBalloonTip(3000);
 
             _updater = new AutoUpdater();
-            _updater.Start();
+            // Check-only polling for the tray menu: first check after 60 s, then hourly.
+            // The installed service (not this process) performs auto-apply.
+            _updateCheckTimer = new System.Threading.Timer(
+                OnUpdateCheckTick, null, TimeSpan.FromSeconds(60), TimeSpan.FromMinutes(60));
         }
 
         public static void Run(bool startServer, bool silent)
@@ -1991,6 +2001,7 @@ namespace DuvcApi
             var status = StatusClient.Check(Program.GetPort());
             var tooltip = BuildTooltip(status);
             UpdateServiceMenu(status);
+            UpdateUpdateMenu();
 
             if (!status.ApiReachable)
             {
@@ -2046,6 +2057,101 @@ namespace DuvcApi
             }
         }
 
+        private void OnUpdateCheckTick(object state)
+        {
+            try
+            {
+                _updater.CheckForUpdate();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Tray update check failed: " + ex.Message);
+            }
+            finally
+            {
+                _firstUpdateCheckDone = true;
+            }
+        }
+
+        private void UpdateUpdateMenu()
+        {
+            if (_updateItem == null) return;
+
+            var info = _updater != null ? _updater.AvailableUpdate : null;
+            if (!_firstUpdateCheckDone)
+            {
+                _updateItem.Text = "Checking for updates…";
+                _updateItem.Enabled = false;
+            }
+            else if (info == null)
+            {
+                _updateItem.Text = "Up to date";
+                _updateItem.Enabled = false;
+            }
+            else
+            {
+                _updateItem.Text = "Update to v" + info.Version;
+                _updateItem.Enabled = true;
+            }
+        }
+
+        private void OnUpdateClicked()
+        {
+            var info = _updater != null ? _updater.AvailableUpdate : null;
+            if (info == null) return;
+
+            bool serviceInstalled = false;
+            try
+            {
+                serviceInstalled = ServiceStatusHelper.GetStatus(Program.ServiceNameConst).IsInstalled;
+            }
+            catch { }
+
+            if (serviceInstalled)
+            {
+                // Delegate to the SYSTEM service via the request file — the kiosk user
+                // cannot overwrite the exe itself.
+                try
+                {
+                    Directory.CreateDirectory(Paths.StateDir);
+                    File.WriteAllText(Paths.RequestFile,
+                        DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
+                    _notifyIcon.BalloonTipTitle = Program.AppTitle;
+                    _notifyIcon.BalloonTipText = "Update to v" + info.Version + " requested…";
+                    _notifyIcon.ShowBalloonTip(3000);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error("Failed to write update request: " + ex.Message);
+                }
+                return;
+            }
+
+            // Standalone (no service): download + apply in-process on a background thread
+            // so the UI thread is not blocked.
+            _notifyIcon.BalloonTipTitle = Program.AppTitle;
+            _notifyIcon.BalloonTipText = "Downloading update v" + info.Version + "…";
+            _notifyIcon.ShowBalloonTip(3000);
+
+            var worker = new Thread(() =>
+            {
+                try
+                {
+                    var verified = _updater.DownloadAndVerify(info);
+                    if (verified != null)
+                    {
+                        _updater.ApplyInProcess(verified);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error("Manual update failed: " + ex.Message);
+                }
+            })
+            { IsBackground = true, Name = "DuvcApiManualUpdate" };
+            worker.Start();
+        }
+
         private void OpenHealthPage()
         {
             var url = string.Format(CultureInfo.InvariantCulture, "http://127.0.0.1:{0}/health", Program.GetPort());
@@ -2058,9 +2164,10 @@ namespace DuvcApi
 
         protected override void ExitThreadCore()
         {
-            if (_updater != null)
+            if (_updateCheckTimer != null)
             {
-                _updater.Stop();
+                _updateCheckTimer.Dispose();
+                _updateCheckTimer = null;
             }
             _timer.Stop();
             _notifyIcon.Visible = false;
