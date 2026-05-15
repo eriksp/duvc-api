@@ -2376,6 +2376,10 @@ namespace DuvcApi
                 var latestVersion = tagName.TrimStart('v');
                 if (!IsNewer(latestVersion, _currentVersion) || string.IsNullOrEmpty(exeUrl))
                 {
+                    if (IsNewer(latestVersion, _currentVersion) && string.IsNullOrEmpty(exeUrl))
+                    {
+                        Logger.Error("Release v" + latestVersion + " has no duvc-api.exe asset.");
+                    }
                     AvailableUpdate = null;
                     return null;
                 }
@@ -2438,28 +2442,35 @@ namespace DuvcApi
         // duvc-cli.exe so it re-extracts, and restarts "app".
         public void ApplyInProcess(string verifiedExePath)
         {
-            var exePath = Paths.CurrentExe;
-            var batchPath = Path.Combine(Path.GetTempPath(), "duvc-api-update.cmd");
-
-            var script = string.Format(CultureInfo.InvariantCulture,
-                "@echo off\r\n:retry\r\ntimeout /t 2 /nobreak >nul\r\n" +
-                "move /Y \"{0}\" \"{1}\" >nul 2>&1\r\nif errorlevel 1 goto retry\r\n" +
-                "del \"{2}\" >nul 2>&1\r\nstart \"\" \"{1}\" app\r\ndel \"%~f0\"\r\n",
-                verifiedExePath, exePath, Paths.SiblingCli(exePath));
-
-            File.WriteAllText(batchPath, script, Encoding.ASCII);
-
-            Logger.Info("Applying update, restarting...");
-            Process.Start(new ProcessStartInfo
+            try
             {
-                FileName = "cmd.exe",
-                Arguments = "/c \"" + batchPath + "\"",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                WindowStyle = ProcessWindowStyle.Hidden
-            });
+                var exePath = Paths.CurrentExe;
+                var batchPath = Path.Combine(Path.GetTempPath(), "duvc-api-update.cmd");
 
-            Application.Exit();
+                var script = string.Format(CultureInfo.InvariantCulture,
+                    "@echo off\r\n:retry\r\ntimeout /t 2 /nobreak >nul\r\n" +
+                    "move /Y \"{0}\" \"{1}\" >nul 2>&1\r\nif errorlevel 1 goto retry\r\n" +
+                    "del \"{2}\" >nul 2>&1\r\nstart \"\" \"{1}\" app\r\ndel \"%~f0\"\r\n",
+                    verifiedExePath, exePath, Paths.SiblingCli(exePath));
+
+                File.WriteAllText(batchPath, script, Encoding.ASCII);
+
+                Logger.Info("Applying update, restarting...");
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = "/c \"" + batchPath + "\"",
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                });
+
+                Application.Exit();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Apply update failed: " + ex.Message);
+            }
         }
 
         private bool FetchLatestRelease(out string tagName, out string exeUrl, out string sha256Url)
