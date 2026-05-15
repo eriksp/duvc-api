@@ -2304,6 +2304,149 @@ namespace DuvcApi
         }
     }
 
+    // Launches a process into the active interactive console session from a
+    // Session 0 service (LocalSystem holds SE_TCB_NAME, required by WTSQueryUserToken).
+    internal static class SessionLauncher
+    {
+        private const uint INVALID_SESSION = 0xFFFFFFFF;
+        private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+        private const uint CREATE_NEW_CONSOLE = 0x00000010;
+        private const uint TOKEN_ALL_ACCESS = 0xF01FF;
+        private const int SecurityImpersonation = 2;
+        private const int TokenPrimary = 1;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct STARTUPINFO
+        {
+            public int cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public uint dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+            public short wShowWindow;
+            public short cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput, hStdOutput, hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public uint dwProcessId;
+            public uint dwThreadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WTSGetActiveConsoleSessionId();
+
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        private static extern bool WTSQueryUserToken(uint sessionId, out IntPtr phToken);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool DuplicateTokenEx(IntPtr hExistingToken, uint dwDesiredAccess,
+            IntPtr lpTokenAttributes, int impersonationLevel, int tokenType, out IntPtr phNewToken);
+
+        [DllImport("userenv.dll", SetLastError = true)]
+        private static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
+
+        [DllImport("userenv.dll", SetLastError = true)]
+        private static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool CreateProcessAsUser(IntPtr hToken, string lpApplicationName,
+            string lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
+            bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory,
+            ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        // True if any process with the given base name (no extension) runs in the
+        // active console session. Excludes Session 0 (the service's own process).
+        public static bool IsRunningInActiveSession(string processName)
+        {
+            uint session = WTSGetActiveConsoleSessionId();
+            if (session == INVALID_SESSION || session == 0) return false;
+
+            foreach (var p in Process.GetProcessesByName(processName))
+            {
+                try
+                {
+                    if ((uint)p.SessionId == session) return true;
+                }
+                catch { }
+                finally { p.Dispose(); }
+            }
+            return false;
+        }
+
+        // Launches "<exePath> <args>" in the active console session. Returns false if
+        // there is no logged-on console user yet, or on any failure (logged).
+        public static bool TryLaunchInActiveSession(string exePath, string args)
+        {
+            uint session = WTSGetActiveConsoleSessionId();
+            if (session == INVALID_SESSION || session == 0)
+            {
+                return false;
+            }
+
+            IntPtr userToken = IntPtr.Zero;
+            IntPtr primaryToken = IntPtr.Zero;
+            IntPtr envBlock = IntPtr.Zero;
+            try
+            {
+                if (!WTSQueryUserToken(session, out userToken))
+                {
+                    // No interactive user logged on yet — caller retries later.
+                    return false;
+                }
+
+                if (!DuplicateTokenEx(userToken, TOKEN_ALL_ACCESS, IntPtr.Zero,
+                        SecurityImpersonation, TokenPrimary, out primaryToken))
+                {
+                    Logger.Error("DuplicateTokenEx failed: " + Marshal.GetLastWin32Error());
+                    return false;
+                }
+
+                CreateEnvironmentBlock(out envBlock, primaryToken, false);
+
+                var si = new STARTUPINFO();
+                si.cb = Marshal.SizeOf(si);
+                si.lpDesktop = "winsta0\\default";
+
+                PROCESS_INFORMATION pi;
+                var commandLine = "\"" + exePath + "\" " + args;
+                bool ok = CreateProcessAsUser(primaryToken, exePath, commandLine,
+                    IntPtr.Zero, IntPtr.Zero, false,
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
+                    envBlock, Path.GetDirectoryName(exePath), ref si, out pi);
+
+                if (!ok)
+                {
+                    Logger.Error("CreateProcessAsUser failed: " + Marshal.GetLastWin32Error());
+                    return false;
+                }
+
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("TryLaunchInActiveSession failed: " + ex.Message);
+                return false;
+            }
+            finally
+            {
+                if (envBlock != IntPtr.Zero) DestroyEnvironmentBlock(envBlock);
+                if (primaryToken != IntPtr.Zero) CloseHandle(primaryToken);
+                if (userToken != IntPtr.Zero) CloseHandle(userToken);
+            }
+        }
+    }
+
     internal static class Paths
     {
         // Users-writable state directory created by `install`. Holds the update
