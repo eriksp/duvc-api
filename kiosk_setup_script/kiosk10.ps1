@@ -550,8 +550,9 @@ if ($InstallDuvc) {
             Write-Host "Camera Control API already installed; ensuring service is running..."
         }
 
-        try { Set-Service -Name $duvcServiceName -StartupType Automatic } catch {}
-        try { Start-Service -Name $duvcServiceName -ErrorAction SilentlyContinue } catch {}
+        # `duvc-api.exe install` now creates the service with start=auto and
+        # starts it itself, so the explicit Set-Service/Start-Service calls
+        # that used to live here are redundant.
 
         try {
             $svcState = (Get-Service -Name $duvcServiceName -ErrorAction SilentlyContinue).Status
