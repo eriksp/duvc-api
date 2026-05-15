@@ -2311,17 +2311,19 @@ namespace DuvcApi
         private const uint INVALID_SESSION = 0xFFFFFFFF;
         private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
         private const uint CREATE_NEW_CONSOLE = 0x00000010;
-        private const uint TOKEN_ALL_ACCESS = 0xF01FF;
+        // TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY — minimum rights
+        // required to create a primary token for CreateProcessAsUser.
+        private const uint TOKEN_RIGHTS = 0x000B;
         private const int SecurityImpersonation = 2;
         private const int TokenPrimary = 1;
 
-        [StructLayout(LayoutKind.Sequential)]
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct STARTUPINFO
         {
             public int cb;
-            public string lpReserved;
-            public string lpDesktop;
-            public string lpTitle;
+            [MarshalAs(UnmanagedType.LPWStr)] public string lpReserved;
+            [MarshalAs(UnmanagedType.LPWStr)] public string lpDesktop;
+            [MarshalAs(UnmanagedType.LPWStr)] public string lpTitle;
             public uint dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
             public short wShowWindow;
             public short cbReserved2;
@@ -2403,14 +2405,20 @@ namespace DuvcApi
                     return false;
                 }
 
-                if (!DuplicateTokenEx(userToken, TOKEN_ALL_ACCESS, IntPtr.Zero,
+                if (!DuplicateTokenEx(userToken, TOKEN_RIGHTS, IntPtr.Zero,
                         SecurityImpersonation, TokenPrimary, out primaryToken))
                 {
                     Logger.Error("DuplicateTokenEx failed: " + Marshal.GetLastWin32Error());
                     return false;
                 }
 
-                CreateEnvironmentBlock(out envBlock, primaryToken, false);
+                if (!CreateEnvironmentBlock(out envBlock, primaryToken, false))
+                {
+                    // Non-fatal: the launched process will inherit the service's
+                    // Session 0 environment instead. Log so this degraded mode is
+                    // observable.
+                    Logger.Error("CreateEnvironmentBlock failed: " + Marshal.GetLastWin32Error());
+                }
 
                 var si = new STARTUPINFO();
                 si.cb = Marshal.SizeOf(si);
