@@ -222,6 +222,9 @@ namespace DuvcApi
 
                     if (File.Exists(Paths.RequestFile))
                     {
+                        // The file's mere existence is the signal — contents are
+                        // intentionally ignored, so a race between the tray's
+                        // WriteAllText and this TryDelete is harmless.
                         TryDelete(Paths.RequestFile);
                         Logger.Info("Manual update request received.");
                         RunUpdate();
@@ -2846,7 +2849,10 @@ namespace DuvcApi
         }
 
         // Last result of CheckForUpdate(): non-null when a newer release exists.
-        public UpdateInfo AvailableUpdate { get; private set; }
+        // Volatile so a tray-UI read sees the write from the pool-thread checker
+        // without a race on the reference publish.
+        private volatile UpdateInfo _availableUpdate;
+        public UpdateInfo AvailableUpdate { get { return _availableUpdate; } }
 
         // Queries releases/latest. Returns an UpdateInfo when a newer version with a
         // duvc-api.exe asset exists, otherwise null. Never throws; caches the result.
@@ -2867,11 +2873,11 @@ namespace DuvcApi
                     {
                         Logger.Error("Release v" + latestVersion + " has no duvc-api.exe asset.");
                     }
-                    AvailableUpdate = null;
+                    _availableUpdate = null;
                     return null;
                 }
 
-                AvailableUpdate = new UpdateInfo
+                _availableUpdate = new UpdateInfo
                 {
                     Version = latestVersion,
                     ExeUrl = exeUrl,
