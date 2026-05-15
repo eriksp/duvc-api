@@ -314,9 +314,18 @@ namespace DuvcApi
                 {
                     Logger.Error("New version unhealthy; rolling back to backup.");
                     StopApp();
-                    File.Copy(backup, exe, true);
-                    TryDelete(cli);
-                    SessionLauncher.TryLaunchInActiveSession(exe, "app");
+                    if (File.Exists(backup))
+                    {
+                        File.Copy(backup, exe, true);
+                        TryDelete(cli);
+                        SessionLauncher.TryLaunchInActiveSession(exe, "app");
+                    }
+                    else
+                    {
+                        // Worst case: rollback impossible. Surface loudly — the
+                        // canonical exe is whatever the failed update left behind.
+                        Logger.Error("Rollback failed: backup not present at " + backup);
+                    }
                 }
             }
             catch (Exception ex)
@@ -338,7 +347,12 @@ namespace DuvcApi
             }
         }
 
-        // Kills every duvc-api process except this service process.
+        // Kills every duvc-api process except this service process. Known
+        // limitation: this also matches a concurrent `duvc-api install` or
+        // `duvc-api uninstall` invocation (same process name). Re-installing
+        // while the watchdog is mid-update is not expected in a kiosk
+        // context. Filtering by command line would require WMI /
+        // NtQueryInformationProcess and is deferred.
         private static void StopApp()
         {
             var selfId = Process.GetCurrentProcess().Id;
