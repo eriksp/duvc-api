@@ -2569,10 +2569,7 @@ namespace DuvcApi
         private static readonly object Sync = new object();
         private static readonly Queue<string> Entries = new Queue<string>();
         private const int MaxEntries = 500;
-        private static readonly string LogPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-            "DuvcApi",
-            "duvc-api.log");
+        private static readonly string LogPath = Paths.LogFile;
         private const long MaxLogSizeBytes = 5 * 1024 * 1024;
 
         public static event Action<string> Logged;
@@ -2807,6 +2804,8 @@ namespace DuvcApi
                     "DuvcApi");
             }
         }
+
+        public static string LogFile { get { return Path.Combine(StateDir, "duvc-api.log"); } }
 
         public static string RequestFile { get { return Path.Combine(StateDir, "update.request"); } }
 
@@ -4029,6 +4028,38 @@ namespace DuvcApi
 
             response.statusCode = response.ok ? 200 : 500;
             return response;
+        }
+    }
+
+    internal static class EmbeddedAssets
+    {
+        public static Image LoadPng(string resourceName)
+        {
+            using (var stream = typeof(EmbeddedAssets).Assembly.GetManifestResourceStream(resourceName))
+            {
+                if (stream == null)
+                {
+                    throw new InvalidOperationException("Embedded resource not found: " + resourceName);
+                }
+                // Image.FromStream requires the stream to stay open for the life of the Image.
+                // Copy into a MemoryStream so the caller can dispose us safely.
+                var ms = new MemoryStream();
+                stream.CopyTo(ms);
+                ms.Position = 0;
+                return Image.FromStream(ms);
+            }
+        }
+
+        public static Icon LoadIcon(string resourceName)
+        {
+            using (var stream = typeof(EmbeddedAssets).Assembly.GetManifestResourceStream(resourceName))
+            {
+                if (stream == null)
+                {
+                    throw new InvalidOperationException("Embedded resource not found: " + resourceName);
+                }
+                return new Icon(stream);
+            }
         }
     }
 }
