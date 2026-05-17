@@ -5,6 +5,8 @@ $src = Join-Path $root "src\DuvcApi\Program.cs"
 $assemblyInfo = Join-Path $root "src\DuvcApi\AssemblyInfo.cs"
 $duvcCli = Join-Path $root "bin\duvc-cli.exe"
 $dist = Join-Path $root "dist"
+$logoPng = Join-Path $root "dist\assets\cellari_logo.png"
+$logoIco = Join-Path $root "dist\assets\cellari_logo.ico"
 
 if (-not (Test-Path $src)) {
     throw "Missing source file: $src"
@@ -16,6 +18,10 @@ if (-not (Test-Path $assemblyInfo)) {
 
 if (-not (Test-Path $duvcCli)) {
     throw "Missing duvc-cli.exe at: $duvcCli"
+}
+
+if (-not (Test-Path $logoPng) -or -not (Test-Path $logoIco)) {
+    throw "Missing raster icons. Run scripts\convert-icon.ps1 first."
 }
 
 if (-not (Test-Path $dist)) {
@@ -37,8 +43,11 @@ $output = Join-Path $dist "duvc-api.exe"
     /nologo `
     /target:winexe `
     /optimize+ `
+    /win32icon:$logoIco `
     /out:$output `
     /resource:$duvcCli,duvc-cli.exe `
+    /resource:$logoPng,cellari_logo.png `
+    /resource:$logoIco,cellari_logo.ico `
     /reference:System.ServiceProcess.dll `
     /reference:System.Windows.Forms.dll `
     /reference:System.Drawing.dll `
