@@ -2287,6 +2287,11 @@ namespace DuvcApi
             }
         }
 
+        internal void RunElevatedFromControlPanel(string command)
+        {
+            RunElevated(command);
+        }
+
         private void ShowContextMenu()
         {
             var menu = _notifyIcon.ContextMenuStrip;
@@ -4085,6 +4090,253 @@ namespace DuvcApi
                     throw new InvalidOperationException("Embedded resource not found: " + resourceName);
                 }
                 return new Icon(stream);
+            }
+        }
+    }
+
+    internal sealed class ControlPanelForm : Form
+    {
+        private static readonly Color OkColor   = Color.FromArgb(0x2E, 0xBC, 0x4F);
+        private static readonly Color WarnColor = Color.FromArgb(0xF2, 0xA9, 0x3B);
+        private static readonly Color BadColor  = Color.FromArgb(0xD6, 0x45, 0x45);
+        private static readonly Color NaColor   = Color.FromArgb(0x9E, 0x9E, 0x9E);
+
+        private readonly TrayApp _tray;
+        private readonly AutoUpdater _updater;
+
+        private readonly System.Windows.Forms.Timer _refreshTimer;
+
+        // Section refs we need to update
+        private Label _modeLabel;
+        private StatusBullet _apiBullet, _watchdogBullet, _serviceBullet;
+        private Label _apiText, _watchdogText, _serviceText;
+        private Label _serviceStatusLabel;
+        private Button _installBtn, _uninstallBtn;
+        private Label _currentVerLabel, _latestVerLabel, _updateStatusLabel;
+        private Button _checkUpdateBtn, _applyUpdateBtn;
+        private LinkLabel _openExeFolderLink, _openStateFolderLink, _openLogFolderLink;
+        private Button _showLogBtn;
+
+        private volatile bool _checking;
+
+        public ControlPanelForm(TrayApp tray, AutoUpdater updater)
+        {
+            _tray = tray;
+            _updater = updater;
+
+            SuspendLayout();
+
+            Text = Program.AppTitle + " — Control Panel";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(720, 600);
+            AutoScroll = true;
+            BackColor = SystemColors.Window;
+            Font = new Font("Segoe UI", 9f);
+
+            try { Icon = EmbeddedAssets.LoadIcon("cellari_logo.ico"); }
+            catch (Exception ex) { Logger.Error("Control Panel icon load failed: " + ex.Message); }
+
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Padding = new Padding(16),
+                BackColor = SystemColors.Window
+            };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+
+            root.Controls.Add(BuildHeader());
+            root.Controls.Add(BuildHealthSection());
+            root.Controls.Add(BuildServiceSection());
+            root.Controls.Add(BuildUpdateSection());
+            root.Controls.Add(BuildPathsSection());
+            root.Controls.Add(BuildAboutSection());
+            root.Controls.Add(BuildFooter());
+
+            Controls.Add(root);
+
+            _refreshTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+            _refreshTimer.Tick += (s, e) => RefreshAll();
+
+            Shown += (s, e) => { RefreshAll(); _refreshTimer.Start(); };
+            FormClosing += (s, e) => { _refreshTimer.Stop(); };
+            Deactivate += (s, e) => _refreshTimer.Stop();
+            Activated += (s, e) => { if (Visible) { RefreshAll(); _refreshTimer.Start(); } };
+
+            ResumeLayout(false);
+        }
+
+        // -- Header ---------------------------------------------------------
+        private Control BuildHeader()
+        {
+            var panel = new TableLayoutPanel
+            {
+                ColumnCount = 2,
+                RowCount = 2,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Margin = new Padding(0, 0, 0, 12)
+            };
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 80f));
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+
+            var pic = new PictureBox
+            {
+                Size = new Size(64, 64),
+                SizeMode = PictureBoxSizeMode.Zoom,
+                Margin = new Padding(0, 0, 8, 0),
+                BackColor = Color.Transparent
+            };
+            try { pic.Image = EmbeddedAssets.LoadPng("cellari_logo.png"); }
+            catch (Exception ex) { Logger.Error("Control Panel logo load failed: " + ex.Message); }
+            panel.Controls.Add(pic, 0, 0);
+            panel.SetRowSpan(pic, 2);
+
+            var title = new Label
+            {
+                Text = "DUVC API Control Panel",
+                Font = new Font("Segoe UI", 14f, FontStyle.Bold),
+                AutoSize = true,
+                Margin = new Padding(0, 2, 0, 0)
+            };
+            panel.Controls.Add(title, 1, 0);
+
+            _modeLabel = new Label
+            {
+                Text = "—",
+                ForeColor = SystemColors.GrayText,
+                AutoSize = true,
+                Margin = new Padding(0, 4, 0, 0)
+            };
+            panel.Controls.Add(_modeLabel, 1, 1);
+
+            return panel;
+        }
+
+        // -- Health ---------------------------------------------------------
+        private Control BuildHealthSection()
+        {
+            var box = NewGroupBox("Health");
+            var grid = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 3,
+                AutoSize = true,
+                Padding = new Padding(8)
+            };
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 24f));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100f));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+
+            _apiBullet = new StatusBullet();
+            _apiText = NewBodyLabel("—");
+            _watchdogBullet = new StatusBullet();
+            _watchdogText = NewBodyLabel("—");
+            _serviceBullet = new StatusBullet();
+            _serviceText = NewBodyLabel("—");
+
+            grid.Controls.Add(_apiBullet,      0, 0); grid.Controls.Add(NewBodyLabel("API"),      1, 0); grid.Controls.Add(_apiText,      2, 0);
+            grid.Controls.Add(_watchdogBullet, 0, 1); grid.Controls.Add(NewBodyLabel("Watchdog"), 1, 1); grid.Controls.Add(_watchdogText, 2, 1);
+            grid.Controls.Add(_serviceBullet,  0, 2); grid.Controls.Add(NewBodyLabel("Service"),  1, 2); grid.Controls.Add(_serviceText,  2, 2);
+
+            box.Controls.Add(grid);
+            return box;
+        }
+
+        // -- Service --------------------------------------------------------
+        private Control BuildServiceSection()
+        {
+            var box = NewGroupBox("Service");
+            var grid = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                AutoSize = true,
+                Padding = new Padding(8)
+            };
+
+            _serviceStatusLabel = NewBodyLabel("Status: —");
+            grid.Controls.Add(_serviceStatusLabel);
+
+            var btnRow = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                AutoSize = true,
+                Margin = new Padding(0, 8, 0, 0)
+            };
+            _installBtn = new Button { Text = "Install Service", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
+            _installBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("install");
+            _uninstallBtn = new Button { Text = "Uninstall Service", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2) };
+            _uninstallBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("uninstall");
+            btnRow.Controls.Add(_installBtn);
+            btnRow.Controls.Add(_uninstallBtn);
+            grid.Controls.Add(btnRow);
+
+            box.Controls.Add(grid);
+            return box;
+        }
+
+        // -- Helpers shared across sections ---------------------------------
+        private static GroupBox NewGroupBox(string title)
+        {
+            return new GroupBox
+            {
+                Text = title,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Dock = DockStyle.Top,
+                Margin = new Padding(0, 0, 0, 12),
+                Padding = new Padding(8, 6, 8, 8),
+                Font = new Font("Segoe UI", 9f, FontStyle.Regular)
+            };
+        }
+
+        private static Label NewBodyLabel(string text)
+        {
+            return new Label
+            {
+                Text = text,
+                AutoSize = true,
+                Margin = new Padding(0, 4, 8, 4)
+            };
+        }
+
+        // Bullet, sections Update/Paths/About/Footer, and RefreshAll come in Task 6.
+        private Control BuildUpdateSection() { return NewGroupBox("Update (filled in Task 6)"); }
+        private Control BuildPathsSection()  { return NewGroupBox("Installed files (filled in Task 6)"); }
+        private Control BuildAboutSection()  { return NewGroupBox("About (filled in Task 6)"); }
+        private Control BuildFooter()        { return new Panel { Height = 1 }; }
+        private void RefreshAll() { /* filled in Task 6 */ }
+    }
+
+    internal sealed class StatusBullet : Label
+    {
+        private Color _fill = Color.FromArgb(0x9E, 0x9E, 0x9E);
+        public StatusBullet()
+        {
+            AutoSize = false;
+            Size = new Size(16, 16);
+            Margin = new Padding(0, 6, 4, 0);
+            BackColor = Color.Transparent;
+        }
+        public void SetColor(Color c)
+        {
+            if (_fill == c) return;
+            _fill = c;
+            Invalidate();
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using (var brush = new SolidBrush(_fill))
+            {
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                e.Graphics.FillEllipse(brush, 2, 2, 12, 12);
             }
         }
     }
