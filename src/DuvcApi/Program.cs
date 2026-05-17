@@ -2257,6 +2257,16 @@ namespace DuvcApi
             }
         }
 
+        internal void OnUpdateClickedFromControlPanel()
+        {
+            OnUpdateClicked();
+        }
+
+        internal void ShowLogFromControlPanel()
+        {
+            ShowLog();
+        }
+
         private void RunElevated(string command)
         {
             try
@@ -4306,12 +4316,307 @@ namespace DuvcApi
             };
         }
 
-        // Bullet, sections Update/Paths/About/Footer, and RefreshAll come in Task 6.
-        private Control BuildUpdateSection() { return NewGroupBox("Update (filled in Task 6)"); }
-        private Control BuildPathsSection()  { return NewGroupBox("Installed files (filled in Task 6)"); }
-        private Control BuildAboutSection()  { return NewGroupBox("About (filled in Task 6)"); }
-        private Control BuildFooter()        { return new Panel { Height = 1 }; }
-        private void RefreshAll() { /* filled in Task 6 */ }
+        // -- Update ---------------------------------------------------------
+        private Control BuildUpdateSection()
+        {
+            var box = NewGroupBox("Update");
+            var grid = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                AutoSize = true,
+                Padding = new Padding(8)
+            };
+
+            var row = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                AutoSize = true
+            };
+            _currentVerLabel   = NewBodyLabel("Current: —");
+            _latestVerLabel    = NewBodyLabel("    Latest: —");
+            _updateStatusLabel = NewBodyLabel("    Status: —");
+            row.Controls.Add(_currentVerLabel);
+            row.Controls.Add(_latestVerLabel);
+            row.Controls.Add(_updateStatusLabel);
+            grid.Controls.Add(row);
+
+            var btnRow = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                AutoSize = true,
+                Margin = new Padding(0, 8, 0, 0)
+            };
+            _checkUpdateBtn = new Button { Text = "Check for updates", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
+            _checkUpdateBtn.Click += (s, e) => OnCheckUpdatesClicked();
+            _applyUpdateBtn = new Button { Text = "Apply update", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2), Enabled = false };
+            _applyUpdateBtn.Click += (s, e) => _tray.OnUpdateClickedFromControlPanel();
+            btnRow.Controls.Add(_checkUpdateBtn);
+            btnRow.Controls.Add(_applyUpdateBtn);
+            grid.Controls.Add(btnRow);
+
+            box.Controls.Add(grid);
+            return box;
+        }
+
+        private void OnCheckUpdatesClicked()
+        {
+            if (_checking) return;
+            _checking = true;
+            _checkUpdateBtn.Enabled = false;
+            _updateStatusLabel.Text = "    Status: Checking…";
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                Exception error = null;
+                try { _updater.CheckForUpdate(); }
+                catch (Exception ex) { error = ex; }
+
+                BeginInvoke(new Action(() =>
+                {
+                    _checking = false;
+                    _checkUpdateBtn.Enabled = true;
+                    if (error != null)
+                    {
+                        var msg = error.Message ?? "";
+                        if (msg.Length > 80) msg = msg.Substring(0, 80) + "…";
+                        _updateStatusLabel.Text = "    Status: Error: " + msg;
+                    }
+                    RefreshAll();
+                }));
+            });
+        }
+
+        // -- Installed files ------------------------------------------------
+        private Control BuildPathsSection()
+        {
+            var box = NewGroupBox("Installed files");
+            var grid = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 3,
+                AutoSize = true,
+                Padding = new Padding(8)
+            };
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100f));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            var monoFont = new Font("Consolas", 9f);
+
+            grid.Controls.Add(NewBodyLabel("Executable:"), 0, 0);
+            grid.Controls.Add(new Label { Text = Paths.CurrentExe, Font = monoFont, AutoSize = true, Margin = new Padding(0, 4, 8, 4) }, 1, 0);
+            _openExeFolderLink = NewOpenFolderLink(Paths.CurrentExe);
+            grid.Controls.Add(_openExeFolderLink, 2, 0);
+
+            grid.Controls.Add(NewBodyLabel("State dir:"), 0, 1);
+            grid.Controls.Add(new Label { Text = Paths.StateDir, Font = monoFont, AutoSize = true, Margin = new Padding(0, 4, 8, 4) }, 1, 1);
+            _openStateFolderLink = NewOpenFolderLink(Paths.StateDir);
+            grid.Controls.Add(_openStateFolderLink, 2, 1);
+
+            grid.Controls.Add(NewBodyLabel("Log file:"), 0, 2);
+            grid.Controls.Add(new Label { Text = Paths.LogFile, Font = monoFont, AutoSize = true, Margin = new Padding(0, 4, 8, 4) }, 1, 2);
+            var logActions = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, AutoSize = true };
+            _openLogFolderLink = NewOpenFolderLink(Paths.LogFile);
+            _showLogBtn = new Button { Text = "Show Log", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2) };
+            _showLogBtn.Click += (s, e) => _tray.ShowLogFromControlPanel();
+            logActions.Controls.Add(_openLogFolderLink);
+            logActions.Controls.Add(_showLogBtn);
+            grid.Controls.Add(logActions, 2, 2);
+
+            box.Controls.Add(grid);
+            return box;
+        }
+
+        private static LinkLabel NewOpenFolderLink(string path)
+        {
+            var link = new LinkLabel
+            {
+                Text = "Open folder",
+                AutoSize = true,
+                Margin = new Padding(0, 4, 0, 4)
+            };
+            link.LinkClicked += (s, e) =>
+            {
+                try
+                {
+                    string target = path;
+                    string args;
+                    if (File.Exists(target))
+                    {
+                        args = "/select,\"" + target + "\"";
+                    }
+                    else if (Directory.Exists(target))
+                    {
+                        args = "\"" + target + "\"";
+                    }
+                    else
+                    {
+                        // Path does not exist yet — open the parent dir if it exists.
+                        var parent = Path.GetDirectoryName(target);
+                        if (string.IsNullOrEmpty(parent) || !Directory.Exists(parent)) return;
+                        args = "\"" + parent + "\"";
+                    }
+                    Process.Start(new ProcessStartInfo("explorer.exe", args) { UseShellExecute = true });
+                }
+                catch (Exception ex) { Logger.Error("Open folder failed: " + ex.Message); }
+            };
+            return link;
+        }
+
+        // -- About ----------------------------------------------------------
+        private Control BuildAboutSection()
+        {
+            var box = NewGroupBox("About");
+            var stack = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                AutoSize = true,
+                Padding = new Padding(8)
+            };
+
+            stack.Controls.Add(NewBodyLabel("DUVC API — Cellari kiosk camera control"));
+            stack.Controls.Add(NewExternalLink("github.com/eriksp/duvc-api", "https://github.com/eriksp/duvc-api"));
+            stack.Controls.Add(NewExternalLink("duvc-cli upstream: github.com/allanhanan/duvc-ctl", "https://github.com/allanhanan/duvc-ctl"));
+
+            box.Controls.Add(stack);
+            return box;
+        }
+
+        private static LinkLabel NewExternalLink(string text, string url)
+        {
+            var link = new LinkLabel { Text = text, AutoSize = true, Margin = new Padding(0, 2, 0, 2) };
+            link.LinkClicked += (s, e) =>
+            {
+                try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+                catch (Exception ex) { Logger.Error("Open link failed: " + ex.Message); }
+            };
+            return link;
+        }
+
+        // -- Footer ---------------------------------------------------------
+        private Control BuildFooter()
+        {
+            var panel = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.RightToLeft,
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                Padding = new Padding(0, 8, 0, 0)
+            };
+            var close = new Button { Text = "Close", AutoSize = true, Padding = new Padding(12, 2, 12, 2) };
+            close.Click += (s, e) => Close();
+            var refresh = new Button { Text = "Refresh", AutoSize = true, Padding = new Padding(12, 2, 12, 2), Margin = new Padding(8, 0, 0, 0) };
+            refresh.Click += (s, e) => RefreshAll();
+            panel.Controls.Add(close);
+            panel.Controls.Add(refresh);
+            return panel;
+        }
+
+        // -- Refresh --------------------------------------------------------
+        private void RefreshAll()
+        {
+            var svc = ServiceStatusHelper.GetStatus(Program.ServiceNameConst);
+            var snap = _tray.GetHealthSnapshot();
+
+            // Mode line
+            if (svc.IsInstalled)
+            {
+                _modeLabel.Text = "Version " + Program.GetVersionLabel().TrimStart('v') + "  ·  Running with service watchdog";
+            }
+            else
+            {
+                _modeLabel.Text = "Version " + Program.GetVersionLabel().TrimStart('v') + "  ·  Running standalone";
+            }
+
+            // API
+            if (snap.Status == null)
+            {
+                _apiBullet.SetColor(NaColor);
+                _apiText.Text = "Pending first check…";
+            }
+            else
+            {
+                var s = snap.Status;
+                var localTime = snap.CheckedAt.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture);
+                if (!s.ApiReachable)
+                {
+                    _apiBullet.SetColor(BadColor);
+                    _apiText.Text = "Down  (last check: " + localTime + ")";
+                }
+                else if (s.CameraFound)
+                {
+                    _apiBullet.SetColor(OkColor);
+                    _apiText.Text = "OK  (last check: " + localTime + ", camera: " + (s.CameraName ?? "—") + ")";
+                }
+                else
+                {
+                    _apiBullet.SetColor(WarnColor);
+                    _apiText.Text = "Reachable, camera missing  (last check: " + localTime + ")";
+                }
+            }
+
+            // Watchdog
+            if (!svc.IsInstalled)
+            {
+                _watchdogBullet.SetColor(NaColor);
+                _watchdogText.Text = "N/A — standalone mode";
+            }
+            else if (svc.IsRunning)
+            {
+                _watchdogBullet.SetColor(OkColor);
+                _watchdogText.Text = "OK";
+            }
+            else
+            {
+                _watchdogBullet.SetColor(BadColor);
+                _watchdogText.Text = "Stopped";
+            }
+
+            // Service
+            if (!svc.IsInstalled)
+            {
+                _serviceBullet.SetColor(NaColor);
+                _serviceText.Text = "Not installed";
+                _serviceStatusLabel.Text = "Status: Not installed";
+                _installBtn.Enabled = true;
+                _uninstallBtn.Enabled = false;
+            }
+            else if (svc.IsRunning)
+            {
+                _serviceBullet.SetColor(OkColor);
+                _serviceText.Text = "Running";
+                _serviceStatusLabel.Text = "Status: Running";
+                _installBtn.Enabled = false;
+                _uninstallBtn.Enabled = true;
+            }
+            else
+            {
+                _serviceBullet.SetColor(WarnColor);
+                _serviceText.Text = "Installed, stopped";
+                _serviceStatusLabel.Text = "Status: Installed, stopped";
+                _installBtn.Enabled = false;
+                _uninstallBtn.Enabled = true;
+            }
+
+            // Update
+            var currentVer = Program.GetVersionLabel().TrimStart('v');
+            _currentVerLabel.Text = "Current: " + currentVer;
+            var avail = _updater != null ? _updater.AvailableUpdate : null;
+            if (avail != null)
+            {
+                _latestVerLabel.Text = "    Latest: " + avail.Version;
+                if (!_checking) _updateStatusLabel.Text = "    Status: Update available";
+                _applyUpdateBtn.Enabled = true;
+            }
+            else
+            {
+                _latestVerLabel.Text = "    Latest: " + currentVer;
+                if (!_checking) _updateStatusLabel.Text = "    Status: Up-to-date";
+                _applyUpdateBtn.Enabled = false;
+            }
+        }
     }
 
     internal sealed class StatusBullet : Label
