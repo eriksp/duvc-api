@@ -4212,16 +4212,11 @@ namespace DuvcApi
 
         // Section refs we need to update
         private Label _modeLabel;
-        private StatusBullet _apiBullet, _watchdogBullet, _serviceBullet;
-        private Label _apiText, _watchdogText, _serviceText;
+        private Label _camerasLabel;
         private Label _serviceStatusLabel;
         private Button _installBtn, _uninstallBtn, _startWatchdogBtn;
-        private Label _currentVerLabel, _latestVerLabel, _updateStatusLabel;
-        private Button _checkUpdateBtn, _applyUpdateBtn;
+        private Button _showHealthBtn, _showLogBtn;
         private LinkLabel _openExeFolderLink, _openStateFolderLink, _openLogFolderLink;
-        private Button _showLogBtn;
-
-        private volatile bool _checking;
 
         public ControlPanelForm(TrayApp tray, AutoUpdater updater)
         {
@@ -4264,8 +4259,6 @@ namespace DuvcApi
 
             root.Controls.Add(BuildHeader());
             root.Controls.Add(BuildHealthSection());
-            root.Controls.Add(BuildServiceSection());
-            root.Controls.Add(BuildUpdateSection());
             root.Controls.Add(BuildPathsSection());
             root.Controls.Add(BuildAboutSection());
             root.Controls.Add(BuildFooter());
@@ -4332,55 +4325,66 @@ namespace DuvcApi
         }
 
         // -- Health ---------------------------------------------------------
+        // Two rows: cameras + actions (Show /health, Show Log); service + actions
+        // (Install/Uninstall/Start Watchdog).
         private Control BuildHealthSection()
         {
             var box = NewGroupBox("Health");
             var grid = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                ColumnCount = 3,
+                ColumnCount = 2,
                 AutoSize = true,
                 Padding = new Padding(8)
             };
-            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 24f));
-            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100f));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f));
 
-            _apiBullet = new StatusBullet();
-            _apiText = NewBodyLabel("—");
-            _watchdogBullet = new StatusBullet();
-            _watchdogText = NewBodyLabel("—");
-            _serviceBullet = new StatusBullet();
-            _serviceText = NewBodyLabel("—");
-
-            grid.Controls.Add(_apiBullet,      0, 0); grid.Controls.Add(NewBodyLabel("API"),      1, 0); grid.Controls.Add(_apiText,      2, 0);
-            grid.Controls.Add(_watchdogBullet, 0, 1); grid.Controls.Add(NewBodyLabel("Watchdog"), 1, 1); grid.Controls.Add(_watchdogText, 2, 1);
-            grid.Controls.Add(_serviceBullet,  0, 2); grid.Controls.Add(NewBodyLabel("Service"),  1, 2); grid.Controls.Add(_serviceText,  2, 2);
-
-            box.Controls.Add(grid);
-            return box;
-        }
-
-        // -- Service --------------------------------------------------------
-        private Control BuildServiceSection()
-        {
-            var box = NewGroupBox("Service");
-            var grid = new TableLayoutPanel
+            // Row 1: cameras  +  [Show /health response] [Show Log]
+            _camerasLabel = new Label
             {
+                Text = "Cameras: —",
+                AutoSize = false,
                 Dock = DockStyle.Fill,
-                ColumnCount = 1,
-                AutoSize = true,
-                Padding = new Padding(8)
+                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
+                Margin = new Padding(0)
             };
+            grid.Controls.Add(_camerasLabel, 0, 0);
 
-            _serviceStatusLabel = NewBodyLabel("Status: —");
-            grid.Controls.Add(_serviceStatusLabel);
-
-            var btnRow = new FlowLayoutPanel
+            var camActions = new FlowLayoutPanel
             {
                 FlowDirection = FlowDirection.LeftToRight,
                 AutoSize = true,
-                Margin = new Padding(0, 8, 0, 0)
+                Margin = new Padding(0),
+                Padding = new Padding(0)
+            };
+            _showHealthBtn = new Button { Text = "Show /health response", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
+            _showHealthBtn.Click += (s, e) => ShowHealthResponseDialog();
+            _showLogBtn = new Button { Text = "Show Log", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2) };
+            _showLogBtn.Click += (s, e) => _tray.ShowLogFromControlPanel();
+            camActions.Controls.Add(_showHealthBtn);
+            camActions.Controls.Add(_showLogBtn);
+            grid.Controls.Add(camActions, 1, 0);
+
+            // Row 2: service status  +  [Install] [Uninstall] [Start Watchdog]
+            _serviceStatusLabel = new Label
+            {
+                Text = "Service: —",
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
+                Margin = new Padding(0)
+            };
+            grid.Controls.Add(_serviceStatusLabel, 0, 1);
+
+            var svcActions = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                AutoSize = true,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
             };
             _installBtn = new Button { Text = "Install Service", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
             _installBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("install");
@@ -4388,13 +4392,180 @@ namespace DuvcApi
             _uninstallBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("uninstall");
             _startWatchdogBtn = new Button { Text = "Start Watchdog", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2), Visible = false };
             _startWatchdogBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("startservice");
-            btnRow.Controls.Add(_installBtn);
-            btnRow.Controls.Add(_uninstallBtn);
-            btnRow.Controls.Add(_startWatchdogBtn);
-            grid.Controls.Add(btnRow);
+            svcActions.Controls.Add(_installBtn);
+            svcActions.Controls.Add(_uninstallBtn);
+            svcActions.Controls.Add(_startWatchdogBtn);
+            grid.Controls.Add(svcActions, 1, 1);
 
             box.Controls.Add(grid);
             return box;
+        }
+
+        private void ShowHealthResponseDialog()
+        {
+            string body;
+            int statusCode;
+            try
+            {
+                var url = string.Format(CultureInfo.InvariantCulture,
+                    "http://127.0.0.1:{0}/health", Program.GetPort());
+                var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+                req.Method = "GET";
+                req.Timeout = 4000;
+                using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                {
+                    statusCode = (int)resp.StatusCode;
+                    body = sr.ReadToEnd();
+                }
+            }
+            catch (System.Net.WebException wex)
+            {
+                var hr = wex.Response as System.Net.HttpWebResponse;
+                statusCode = hr != null ? (int)hr.StatusCode : 0;
+                try
+                {
+                    if (wex.Response == null) throw new InvalidOperationException(wex.Message);
+                    using (var sr = new StreamReader(wex.Response.GetResponseStream()))
+                    {
+                        body = sr.ReadToEnd();
+                    }
+                }
+                catch { body = wex.Message; }
+            }
+            catch (Exception ex)
+            {
+                statusCode = 0;
+                body = ex.Message;
+            }
+
+            using (var dlg = new Form
+            {
+                Text = "/health response — HTTP " + statusCode,
+                FormBorderStyle = FormBorderStyle.Sizable,
+                StartPosition = FormStartPosition.CenterParent,
+                ClientSize = new Size(640, 480),
+                MinimizeBox = false,
+                MaximizeBox = true,
+                ShowInTaskbar = false,
+                Font = new Font("Segoe UI", 9f)
+            })
+            {
+                try { dlg.Icon = EmbeddedAssets.LoadIcon("cellari_logo.ico"); } catch { }
+
+                var box = new TextBox
+                {
+                    Multiline = true,
+                    ReadOnly = true,
+                    ScrollBars = ScrollBars.Both,
+                    WordWrap = false,
+                    Font = new Font("Consolas", 9f),
+                    Dock = DockStyle.Fill,
+                    Text = PrettyPrintJsonIfPossible(body)
+                };
+                var bottom = new FlowLayoutPanel
+                {
+                    FlowDirection = FlowDirection.RightToLeft,
+                    Dock = DockStyle.Bottom,
+                    AutoSize = true,
+                    Padding = new Padding(8)
+                };
+                var close = new Button { Text = "Close", AutoSize = true, Padding = new Padding(12, 2, 12, 2) };
+                close.Click += (s, e) => dlg.Close();
+                var copy = new Button { Text = "Copy", AutoSize = true, Padding = new Padding(12, 2, 12, 2), Margin = new Padding(8, 0, 0, 0) };
+                copy.Click += (s, e) =>
+                {
+                    try { Clipboard.SetText(box.Text); }
+                    catch (Exception ex) { Logger.Error("Clipboard copy failed: " + ex.Message); }
+                };
+                bottom.Controls.Add(close);
+                bottom.Controls.Add(copy);
+                dlg.Controls.Add(box);
+                dlg.Controls.Add(bottom);
+                dlg.ShowDialog(this);
+            }
+        }
+
+        // Lightweight JSON pretty-printer: re-emits the value with 2-space
+        // indentation. Falls back to the raw text if parsing fails.
+        private static string PrettyPrintJsonIfPossible(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return raw;
+            try
+            {
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer();
+                ser.MaxJsonLength = 4 * 1024 * 1024;
+                var obj = ser.DeserializeObject(raw);
+                var sb = new StringBuilder();
+                WriteJsonPretty(sb, obj, 0);
+                return sb.ToString();
+            }
+            catch
+            {
+                return raw;
+            }
+        }
+
+        private static void WriteJsonPretty(StringBuilder sb, object value, int depth)
+        {
+            var indent = new string(' ', depth * 2);
+            var inner = new string(' ', (depth + 1) * 2);
+            var dict = value as IDictionary<string, object>;
+            if (dict != null)
+            {
+                if (dict.Count == 0) { sb.Append("{}"); return; }
+                sb.Append("{\n");
+                var first = true;
+                foreach (var kvp in dict)
+                {
+                    if (!first) sb.Append(",\n");
+                    sb.Append(inner).Append('"').Append(EscapeJson(kvp.Key)).Append("\": ");
+                    WriteJsonPretty(sb, kvp.Value, depth + 1);
+                    first = false;
+                }
+                sb.Append('\n').Append(indent).Append('}');
+                return;
+            }
+            var arr = value as object[];
+            if (arr != null)
+            {
+                if (arr.Length == 0) { sb.Append("[]"); return; }
+                sb.Append("[\n");
+                for (var i = 0; i < arr.Length; i++)
+                {
+                    sb.Append(inner);
+                    WriteJsonPretty(sb, arr[i], depth + 1);
+                    if (i < arr.Length - 1) sb.Append(',');
+                    sb.Append('\n');
+                }
+                sb.Append(indent).Append(']');
+                return;
+            }
+            if (value == null) { sb.Append("null"); return; }
+            if (value is bool) { sb.Append((bool)value ? "true" : "false"); return; }
+            if (value is string) { sb.Append('"').Append(EscapeJson((string)value)).Append('"'); return; }
+            sb.Append(Convert.ToString(value, CultureInfo.InvariantCulture));
+        }
+
+        private static string EscapeJson(string s)
+        {
+            var sb = new StringBuilder(s.Length);
+            foreach (var c in s)
+            {
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"':  sb.Append("\\\""); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 0x20) sb.AppendFormat(CultureInfo.InvariantCulture, "\\u{0:X4}", (int)c);
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            return sb.ToString();
         }
 
         // -- Helpers shared across sections ---------------------------------
@@ -4422,77 +4593,6 @@ namespace DuvcApi
             };
         }
 
-        // -- Update ---------------------------------------------------------
-        private Control BuildUpdateSection()
-        {
-            var box = NewGroupBox("Update");
-            var grid = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 1,
-                AutoSize = true,
-                Padding = new Padding(8)
-            };
-
-            var row = new FlowLayoutPanel
-            {
-                FlowDirection = FlowDirection.LeftToRight,
-                AutoSize = true
-            };
-            _currentVerLabel   = NewBodyLabel("Current: —");
-            _latestVerLabel    = NewBodyLabel("    Latest: —");
-            _updateStatusLabel = NewBodyLabel("    Status: —");
-            row.Controls.Add(_currentVerLabel);
-            row.Controls.Add(_latestVerLabel);
-            row.Controls.Add(_updateStatusLabel);
-            grid.Controls.Add(row);
-
-            var btnRow = new FlowLayoutPanel
-            {
-                FlowDirection = FlowDirection.LeftToRight,
-                AutoSize = true,
-                Margin = new Padding(0, 8, 0, 0)
-            };
-            _checkUpdateBtn = new Button { Text = "Check for updates", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
-            _checkUpdateBtn.Click += (s, e) => OnCheckUpdatesClicked();
-            _applyUpdateBtn = new Button { Text = "Apply update", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2), Enabled = false };
-            _applyUpdateBtn.Click += (s, e) => _tray.OnUpdateClickedFromControlPanel();
-            btnRow.Controls.Add(_checkUpdateBtn);
-            btnRow.Controls.Add(_applyUpdateBtn);
-            grid.Controls.Add(btnRow);
-
-            box.Controls.Add(grid);
-            return box;
-        }
-
-        private void OnCheckUpdatesClicked()
-        {
-            if (_checking) return;
-            _checking = true;
-            _checkUpdateBtn.Enabled = false;
-            _updateStatusLabel.Text = "    Status: Checking…";
-
-            System.Threading.Tasks.Task.Run(() =>
-            {
-                Exception error = null;
-                try { _updater.CheckForUpdate(); }
-                catch (Exception ex) { error = ex; }
-
-                BeginInvoke(new Action(() =>
-                {
-                    _checking = false;
-                    _checkUpdateBtn.Enabled = true;
-                    if (error != null)
-                    {
-                        var msg = error.Message ?? "";
-                        if (msg.Length > 80) msg = msg.Substring(0, 80) + "…";
-                        _updateStatusLabel.Text = "    Status: Error: " + msg;
-                    }
-                    RefreshAll();
-                }));
-            });
-        }
-
         // -- Installed files ------------------------------------------------
         private Control BuildPathsSection()
         {
@@ -4512,7 +4612,7 @@ namespace DuvcApi
             // AutoSize-to-smallest behaviour.
             grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f));
+            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
             var monoFont = new Font("Consolas", 9f);
 
@@ -4527,20 +4627,9 @@ namespace DuvcApi
             grid.Controls.Add(_openStateFolderLink, 2, 1);
 
             grid.Controls.Add(NewBodyLabel("Log file:"), 0, 2);
-            grid.Controls.Add(new Label { Text = Paths.LogFile, Font = monoFont, AutoSize = true, Margin = new Padding(0, 8, 8, 0), TextAlign = System.Drawing.ContentAlignment.MiddleLeft }, 1, 2);
-            var logActions = new FlowLayoutPanel
-            {
-                FlowDirection = FlowDirection.LeftToRight,
-                AutoSize = true,
-                Margin = new Padding(0, 4, 0, 0),
-                Padding = new Padding(0)
-            };
+            grid.Controls.Add(new Label { Text = Paths.LogFile, Font = monoFont, AutoSize = true, Margin = new Padding(0, 4, 8, 4) }, 1, 2);
             _openLogFolderLink = NewOpenFolderLink(Paths.LogFile);
-            _showLogBtn = new Button { Text = "Show Log", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2) };
-            _showLogBtn.Click += (s, e) => _tray.ShowLogFromControlPanel();
-            logActions.Controls.Add(_openLogFolderLink);
-            logActions.Controls.Add(_showLogBtn);
-            grid.Controls.Add(logActions, 2, 2);
+            grid.Controls.Add(_openLogFolderLink, 2, 2);
 
             box.Controls.Add(grid);
             return box;
@@ -4636,106 +4725,58 @@ namespace DuvcApi
         private void RefreshAll()
         {
             var svc = ServiceStatusHelper.GetStatus(Program.ServiceNameConst);
-            var snap = _tray.GetHealthSnapshot();
 
             // Mode line
-            if (svc.IsInstalled)
-            {
-                _modeLabel.Text = "Version " + Program.GetVersionLabel().TrimStart('v') + "  ·  Running with service watchdog";
-            }
-            else
-            {
-                _modeLabel.Text = "Version " + Program.GetVersionLabel().TrimStart('v') + "  ·  Running standalone";
-            }
+            var verPrefix = "Version " + Program.GetVersionLabel().TrimStart('v') + "  ·  ";
+            _modeLabel.Text = verPrefix + (svc.IsInstalled ? "Running with service watchdog" : "Running standalone");
 
-            // API
-            if (snap.Status == null)
+            // Cameras row
+            try
             {
-                _apiBullet.SetColor(NaColor);
-                _apiText.Text = "Pending first check…";
-            }
-            else
-            {
-                var s = snap.Status;
-                var localTime = snap.CheckedAt.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture);
-                if (!s.ApiReachable)
+                var devices = DuvcCli.ListDevices(false);
+                if (devices == null || devices.Count == 0)
                 {
-                    _apiBullet.SetColor(BadColor);
-                    _apiText.Text = "Down  (last check: " + localTime + ")";
-                }
-                else if (s.CameraFound)
-                {
-                    _apiBullet.SetColor(OkColor);
-                    _apiText.Text = "OK  (last check: " + localTime + ", camera: " + (s.CameraName ?? "—") + ")";
+                    _camerasLabel.Text = "Cameras: none detected";
+                    _camerasLabel.ForeColor = BadColor;
                 }
                 else
                 {
-                    _apiBullet.SetColor(WarnColor);
-                    _apiText.Text = "Reachable, camera missing  (last check: " + localTime + ")";
+                    var names = new List<string>(devices.Count);
+                    foreach (var d in devices) names.Add(d.name);
+                    _camerasLabel.Text = "Cameras (" + devices.Count + "): " + string.Join(", ", names.ToArray());
+                    _camerasLabel.ForeColor = OkColor;
                 }
             }
-
-            // Watchdog
-            if (!svc.IsInstalled)
+            catch (Exception ex)
             {
-                _watchdogBullet.SetColor(NaColor);
-                _watchdogText.Text = "N/A — standalone mode";
-            }
-            else if (svc.IsRunning)
-            {
-                _watchdogBullet.SetColor(OkColor);
-                _watchdogText.Text = "OK";
-            }
-            else
-            {
-                _watchdogBullet.SetColor(BadColor);
-                _watchdogText.Text = "Stopped";
+                _camerasLabel.Text = "Cameras: error — " + ex.Message;
+                _camerasLabel.ForeColor = BadColor;
             }
 
-            // Service
+            // Service row
             if (!svc.IsInstalled)
             {
-                _serviceBullet.SetColor(NaColor);
-                _serviceText.Text = "Not installed";
-                _serviceStatusLabel.Text = "Status: Not installed";
+                _serviceStatusLabel.Text = "Service: Not installed";
+                _serviceStatusLabel.ForeColor = NaColor;
                 _installBtn.Enabled = true;
                 _uninstallBtn.Enabled = false;
                 _startWatchdogBtn.Visible = false;
             }
             else if (svc.IsRunning)
             {
-                _serviceBullet.SetColor(OkColor);
-                _serviceText.Text = "Running";
-                _serviceStatusLabel.Text = "Status: Running";
+                _serviceStatusLabel.Text = "Service: Running";
+                _serviceStatusLabel.ForeColor = OkColor;
                 _installBtn.Enabled = false;
                 _uninstallBtn.Enabled = true;
                 _startWatchdogBtn.Visible = false;
             }
             else
             {
-                _serviceBullet.SetColor(WarnColor);
-                _serviceText.Text = "Installed, stopped";
-                _serviceStatusLabel.Text = "Status: Installed, stopped";
+                _serviceStatusLabel.Text = "Service: Installed, stopped";
+                _serviceStatusLabel.ForeColor = WarnColor;
                 _installBtn.Enabled = false;
                 _uninstallBtn.Enabled = true;
                 _startWatchdogBtn.Visible = true;
-            }
-
-            // Update
-            var currentVer = Program.GetVersionLabel().TrimStart('v');
-            _currentVerLabel.Text = "Current: " + currentVer;
-            var avail = _updater != null ? _updater.AvailableUpdate : null;
-            if (avail != null)
-            {
-                _latestVerLabel.Text = "    Latest: " + avail.Version;
-                if (!_checking) _updateStatusLabel.Text = "    Status: Update available";
-                _applyUpdateBtn.Enabled = true;
-            }
-            else
-            {
-                _latestVerLabel.Text = "    Latest: " + currentVer;
-                if (!_checking) _updateStatusLabel.Text = "    Status: Up-to-date";
-                _applyUpdateBtn.Enabled = false;
             }
         }
     }
