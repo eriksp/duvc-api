@@ -761,7 +761,6 @@ namespace DuvcApi
                     status = cameraFound ? "ready" : "missing",
                     cameraFound,
                     cameraName = resolved,
-                    cameraNameConfigured = _cameraName,
                     cameraIndex = index,
                     appVersion = Program.GetVersionLabel(),
                     devices
@@ -1022,7 +1021,6 @@ namespace DuvcApi
                     status = cameraFound ? "ready" : "missing",
                     cameraFound = cameraFound,
                     cameraName = resolved,
-                    cameraNameConfigured = _cameraName,
                     cameraIndex = index,
                     wsClients = _webSockets.ClientCount,
                     timestamp = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)
@@ -1039,7 +1037,6 @@ namespace DuvcApi
                     status = "error",
                     cameraFound = false,
                     cameraName = _cameraName,
-                    cameraNameConfigured = _cameraName,
                     cameraIndex = null,
                     wsClients = _webSockets.ClientCount,
                     timestamp = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
@@ -2625,7 +2622,6 @@ namespace DuvcApi
         public string status { get; set; }
         public bool cameraFound { get; set; }
         public string cameraName { get; set; }
-        public string cameraNameConfigured { get; set; }
         public int? cameraIndex { get; set; }
         public int wsClients { get; set; }
         public string timestamp { get; set; }
