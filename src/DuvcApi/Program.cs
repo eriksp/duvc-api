@@ -44,6 +44,8 @@ namespace DuvcApi
                         return ServiceInstaller.Install(ServiceNameConst, ServiceDisplayName);
                     case "uninstall":
                         return ServiceInstaller.Uninstall(ServiceNameConst);
+                    case "startservice":
+                        return ServiceInstaller.StartIfInstalled(ServiceNameConst);
                     case "service":
                         ServiceBaseHost.Run(ServiceNameConst, ServiceDisplayName);
                         return 0;
@@ -60,7 +62,7 @@ namespace DuvcApi
                         LogApp.Run();
                         return 0;
                     default:
-                        Console.Error.WriteLine("Unknown command. Use: install | uninstall | service | tray | run");
+                        Console.Error.WriteLine("Unknown command. Use: install | uninstall | startservice | service | tray | run");
                         return 2;
                 }
             }
@@ -1685,6 +1687,24 @@ namespace DuvcApi
             return RunSc(string.Format(CultureInfo.InvariantCulture, "delete {0}", serviceName));
         }
 
+        // Elevated entry point: start the service if installed.
+        // Called by the Control Panel "Start Watchdog" button via RunElevated("startservice").
+        public static int StartIfInstalled(string serviceName)
+        {
+            var status = ServiceStatusHelper.GetStatus(serviceName);
+            if (!status.IsInstalled)
+            {
+                Console.Error.WriteLine("Service is not installed.");
+                return 1;
+            }
+            if (status.IsRunning)
+            {
+                Console.WriteLine("Service is already running.");
+                return 0;
+            }
+            return RunSc(string.Format(CultureInfo.InvariantCulture, "start {0}", serviceName));
+        }
+
         private static int RunSc(string arguments)
         {
             var startInfo = new ProcessStartInfo
@@ -1886,6 +1906,8 @@ namespace DuvcApi
                 }
             }
 
+            TryStartWatchdogIfInstalled();
+
             _okIcon = TrayIconFactory.CreateStatusIcon(Color.FromArgb(0, 200, 0));
             _warnIcon = TrayIconFactory.CreateStatusIcon(Color.FromArgb(220, 180, 0));
             _wsIcon = TrayIconFactory.CreateStatusIcon(Color.FromArgb(0, 120, 215));
@@ -2063,6 +2085,29 @@ namespace DuvcApi
                     Status = _lastStatus,
                     CheckedAt = _lastStatusAt
                 };
+            }
+        }
+
+        // Opportunistic: if the service is installed but stopped, try to start it.
+        // Succeeds silently when the user happens to be an admin; otherwise the
+        // ServiceController.Start() throws InvalidOperationException (access denied)
+        // and the Control Panel's "Start Watchdog" button handles the elevated path.
+        private void TryStartWatchdogIfInstalled()
+        {
+            try
+            {
+                var status = ServiceStatusHelper.GetStatus(Program.ServiceNameConst);
+                if (!status.IsInstalled || status.IsRunning) return;
+                using (var sc = new ServiceController(Program.ServiceNameConst))
+                {
+                    sc.Start();
+                    sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(8));
+                    Logger.Info("Watchdog service started by standalone tray.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Info("Watchdog auto-start skipped: " + ex.Message);
             }
         }
 
@@ -4147,7 +4192,7 @@ namespace DuvcApi
         private StatusBullet _apiBullet, _watchdogBullet, _serviceBullet;
         private Label _apiText, _watchdogText, _serviceText;
         private Label _serviceStatusLabel;
-        private Button _installBtn, _uninstallBtn;
+        private Button _installBtn, _uninstallBtn, _startWatchdogBtn;
         private Label _currentVerLabel, _latestVerLabel, _updateStatusLabel;
         private Button _checkUpdateBtn, _applyUpdateBtn;
         private LinkLabel _openExeFolderLink, _openStateFolderLink, _openLogFolderLink;
@@ -4163,21 +4208,29 @@ namespace DuvcApi
             SuspendLayout();
 
             Text = Program.AppTitle + " — Control Panel";
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(720, 600);
-            AutoScroll = true;
+            ClientSize = new Size(760, 760);
+            MinimumSize = new Size(640, 480);
             BackColor = SystemColors.Window;
             Font = new Font("Segoe UI", 9f);
 
             try { Icon = EmbeddedAssets.LoadIcon("cellari_logo.ico"); }
             catch (Exception ex) { Logger.Error("Control Panel icon load failed: " + ex.Message); }
 
-            var root = new TableLayoutPanel
+            // Scrollable host so the form stays usable on small screens / DPI scaling.
+            var scrollHost = new Panel
             {
                 Dock = DockStyle.Fill,
+                AutoScroll = true,
+                BackColor = SystemColors.Window
+            };
+
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
                 ColumnCount = 1,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
@@ -4194,7 +4247,8 @@ namespace DuvcApi
             root.Controls.Add(BuildAboutSection());
             root.Controls.Add(BuildFooter());
 
-            Controls.Add(root);
+            scrollHost.Controls.Add(root);
+            Controls.Add(scrollHost);
 
             _refreshTimer = new System.Windows.Forms.Timer { Interval = 3000 };
             _refreshTimer.Tick += (s, e) => RefreshAll();
@@ -4309,8 +4363,11 @@ namespace DuvcApi
             _installBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("install");
             _uninstallBtn = new Button { Text = "Uninstall Service", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2) };
             _uninstallBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("uninstall");
+            _startWatchdogBtn = new Button { Text = "Start Watchdog", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2), Visible = false };
+            _startWatchdogBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("startservice");
             btnRow.Controls.Add(_installBtn);
             btnRow.Controls.Add(_uninstallBtn);
+            btnRow.Controls.Add(_startWatchdogBtn);
             grid.Controls.Add(btnRow);
 
             box.Controls.Add(grid);
@@ -4608,6 +4665,7 @@ namespace DuvcApi
                 _serviceStatusLabel.Text = "Status: Not installed";
                 _installBtn.Enabled = true;
                 _uninstallBtn.Enabled = false;
+                _startWatchdogBtn.Visible = false;
             }
             else if (svc.IsRunning)
             {
@@ -4616,6 +4674,7 @@ namespace DuvcApi
                 _serviceStatusLabel.Text = "Status: Running";
                 _installBtn.Enabled = false;
                 _uninstallBtn.Enabled = true;
+                _startWatchdogBtn.Visible = false;
             }
             else
             {
@@ -4624,6 +4683,7 @@ namespace DuvcApi
                 _serviceStatusLabel.Text = "Status: Installed, stopped";
                 _installBtn.Enabled = false;
                 _uninstallBtn.Enabled = true;
+                _startWatchdogBtn.Visible = true;
             }
 
             // Update
