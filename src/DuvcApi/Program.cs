@@ -1862,6 +1862,7 @@ namespace DuvcApi
         private readonly object _statusLock = new object();
         private StatusResult _lastStatus;
         private DateTime _lastStatusAt;
+        private ControlPanelForm _controlPanel;
 
         private TrayApp(bool startServer)
         {
@@ -1905,10 +1906,8 @@ namespace DuvcApi
             {
                 Enabled = false
             };
-            var open = new ToolStripMenuItem("Open Health Page");
-            open.Click += (sender, args) => OpenHealthPage();
-            var log = new ToolStripMenuItem("Show Log");
-            log.Click += (sender, args) => ShowLog();
+            var controlPanel = new ToolStripMenuItem("Show Control Panel");
+            controlPanel.Click += (sender, args) => ShowControlPanel();
             _installServiceItem = new ToolStripMenuItem("Install Camera API as Service");
             _installServiceItem.Click += (sender, args) => RunElevated("install");
             _uninstallServiceItem = new ToolStripMenuItem("Uninstall Camera API Service");
@@ -1919,8 +1918,7 @@ namespace DuvcApi
             exit.Click += (sender, args) => ExitThread();
             menu.Items.Add(appTitle);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(open);
-            menu.Items.Add(log);
+            menu.Items.Add(controlPanel);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(_installServiceItem);
             menu.Items.Add(_uninstallServiceItem);
@@ -1935,7 +1933,7 @@ namespace DuvcApi
                     ShowContextMenu();
                 }
             };
-            _notifyIcon.DoubleClick += (sender, args) => ShowLog();
+            _notifyIcon.DoubleClick += (sender, args) => ShowControlPanel();
 
             _timer = new System.Windows.Forms.Timer { Interval = 2000 };
             _timer.Tick += (sender, args) => UpdateStatus();
@@ -2175,16 +2173,6 @@ namespace DuvcApi
             worker.Start();
         }
 
-        private void OpenHealthPage()
-        {
-            var url = string.Format(CultureInfo.InvariantCulture, "http://127.0.0.1:{0}/health", Program.GetPort());
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = url,
-                UseShellExecute = true
-            });
-        }
-
         protected override void ExitThreadCore()
         {
             if (_updateCheckTimer != null)
@@ -2254,6 +2242,33 @@ namespace DuvcApi
             {
                 Logger.Error("Show log failed: " + ex.Message);
                 MessageBox.Show("Failed to open log window: " + ex.Message, "DUVC API", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ShowControlPanel()
+        {
+            try
+            {
+                if (_controlPanel == null || _controlPanel.IsDisposed)
+                {
+                    _controlPanel = new ControlPanelForm(this, _updater);
+                    _controlPanel.FormClosed += (s, e) => _controlPanel = null;
+                    _controlPanel.Show();
+                }
+                else
+                {
+                    if (_controlPanel.WindowState == FormWindowState.Minimized)
+                    {
+                        _controlPanel.WindowState = FormWindowState.Normal;
+                    }
+                    _controlPanel.BringToFront();
+                    _controlPanel.Activate();
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Show control panel failed: " + ex.Message);
+                MessageBox.Show("Failed to open Control Panel: " + ex.Message, Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
