@@ -20,13 +20,14 @@
 
 ---
 
-## Task 1: Generate raster icons from the SVG
+## Task 1: Generate the multi-size ICO from the existing PNG
+
+The user has already provided `dist/assets/cellari_logo.png` (384×384 RGBA). We only need to generate a multi-size `.ico` from it. The SVG remains in the repo as a reference source. **No Inkscape required** — the script uses `System.Drawing` (built into .NET on Windows).
 
 **Files:**
 - Create: `scripts/convert-icon.ps1`
-- Create: `dist/assets/cellari_logo_256.png` (generated)
 - Create: `dist/assets/cellari_logo.ico` (generated)
-- Read only: `dist/assets/cellari_logo.svg`
+- Read only: `dist/assets/cellari_logo.png`
 
 - [ ] **Step 1: Create the conversion script**
 
@@ -36,101 +37,95 @@ Write `scripts/convert-icon.ps1`:
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$svg  = Join-Path $root "dist\assets\cellari_logo.svg"
-$png  = Join-Path $root "dist\assets\cellari_logo_256.png"
+$png  = Join-Path $root "dist\assets\cellari_logo.png"
 $ico  = Join-Path $root "dist\assets\cellari_logo.ico"
 
-if (-not (Test-Path $svg)) { throw "Missing SVG: $svg" }
+if (-not (Test-Path $png)) { throw "Missing source PNG: $png" }
 
-$inkscape = (Get-Command inkscape -ErrorAction SilentlyContinue)
-if (-not $inkscape) {
-    throw @"
-Inkscape not found on PATH. Install from https://inkscape.org and re-run.
-This script only needs to run when dist\assets\cellari_logo.svg changes.
-The generated PNG and ICO are committed to git.
-"@
-}
-
-Write-Host "Rasterising $svg -> $png (256x256)"
-& inkscape --export-type=png --export-filename=$png --export-width=256 --export-height=256 $svg | Out-Null
-if (-not (Test-Path $png)) { throw "PNG export failed" }
-
-$tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:TEMP "cellari_logo_ico")
-$sizes = 16, 32, 48, 256
-$pngFiles = @()
-foreach ($size in $sizes) {
-    $out = Join-Path $tmp.FullName "logo_$size.png"
-    & inkscape --export-type=png --export-filename=$out --export-width=$size --export-height=$size $svg | Out-Null
-    if (-not (Test-Path $out)) { throw "PNG export failed for size $size" }
-    $pngFiles += $out
-}
-
-Write-Host "Packing ICO -> $ico (sizes: $($sizes -join ', '))"
 Add-Type -AssemblyName System.Drawing
-$icons = @()
-foreach ($p in $pngFiles) {
-    $bytes = [IO.File]::ReadAllBytes($p)
-    $icons += ,@($bytes)
+
+$source = [System.Drawing.Image]::FromFile((Resolve-Path $png).Path)
+try {
+    $sizes = 16, 32, 48, 256
+    $payloads = @()
+    foreach ($size in $sizes) {
+        $bmp = New-Object System.Drawing.Bitmap $size, $size, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        try {
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            try {
+                $g.InterpolationMode  = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $g.SmoothingMode      = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+                $g.PixelOffsetMode    = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+                $g.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+                $g.Clear([System.Drawing.Color]::Transparent)
+                $g.DrawImage($source, 0, 0, $size, $size)
+            } finally { $g.Dispose() }
+            $ms = New-Object IO.MemoryStream
+            try {
+                $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+                $payloads += ,$ms.ToArray()
+            } finally { $ms.Dispose() }
+        } finally { $bmp.Dispose() }
+    }
+} finally { $source.Dispose() }
+
+# Build ICO container: ICONDIR + ICONDIRENTRYs + PNG payloads.
+$out = New-Object IO.MemoryStream
+$bw  = New-Object IO.BinaryWriter($out)
+try {
+    $bw.Write([uint16]0)            # reserved
+    $bw.Write([uint16]1)            # type = 1 (icon)
+    $bw.Write([uint16]$payloads.Count)
+
+    $headerSize = 6 + (16 * $payloads.Count)
+    $offset = $headerSize
+    for ($i = 0; $i -lt $payloads.Count; $i++) {
+        $size    = $sizes[$i]
+        $payload = $payloads[$i]
+        $w = if ($size -ge 256) { 0 } else { $size }
+        $h = if ($size -ge 256) { 0 } else { $size }
+        $bw.Write([byte]$w)              # width  (0 means 256)
+        $bw.Write([byte]$h)              # height (0 means 256)
+        $bw.Write([byte]0)               # palette count
+        $bw.Write([byte]0)               # reserved
+        $bw.Write([uint16]1)             # planes
+        $bw.Write([uint16]32)            # bits-per-pixel
+        $bw.Write([uint32]$payload.Length)
+        $bw.Write([uint32]$offset)
+        $offset += $payload.Length
+    }
+    foreach ($payload in $payloads) { $bw.Write($payload) }
+    $bw.Flush()
+    [IO.File]::WriteAllBytes($ico, $out.ToArray())
+} finally {
+    $bw.Dispose()
+    $out.Dispose()
 }
 
-# Build ICO container manually (ICONDIR + ICONDIRENTRYs + PNG payloads).
-$ms = New-Object IO.MemoryStream
-$bw = New-Object IO.BinaryWriter($ms)
-$bw.Write([uint16]0)              # reserved
-$bw.Write([uint16]1)              # type = 1 (icon)
-$bw.Write([uint16]$icons.Count)   # image count
-
-$headerSize = 6 + (16 * $icons.Count)
-$offset = $headerSize
-for ($i = 0; $i -lt $icons.Count; $i++) {
-    $size = $sizes[$i]
-    $payload = $icons[$i]
-    $w = if ($size -ge 256) { 0 } else { $size }
-    $h = if ($size -ge 256) { 0 } else { $size }
-    $bw.Write([byte]$w)            # width
-    $bw.Write([byte]$h)            # height
-    $bw.Write([byte]0)             # palette
-    $bw.Write([byte]0)             # reserved
-    $bw.Write([uint16]1)           # planes
-    $bw.Write([uint16]32)          # bpp
-    $bw.Write([uint32]$payload.Length)  # bytes in res
-    $bw.Write([uint32]$offset)     # offset to payload
-    $offset += $payload.Length
-}
-foreach ($payload in $icons) {
-    $bw.Write($payload)
-}
-$bw.Flush()
-[IO.File]::WriteAllBytes($ico, $ms.ToArray())
-$bw.Dispose()
-$ms.Dispose()
-Remove-Item -Recurse -Force $tmp.FullName
-
-Write-Host "Done. PNG=$png ICO=$ico"
+Write-Host ("Wrote {0} ({1} bytes, sizes: {2})" -f $ico, (Get-Item $ico).Length, ($sizes -join ', '))
 ```
 
-- [ ] **Step 2: Run the script and verify outputs**
+- [ ] **Step 2: Run the script and verify the ICO**
 
 Run: `powershell -ExecutionPolicy Bypass -File .\scripts\convert-icon.ps1`
 
-Expected: prints `Done. PNG=... ICO=...` and both files exist.
+Expected: prints `Wrote ...\cellari_logo.ico (NNNN bytes, sizes: 16, 32, 48, 256)`.
 
-Verify with:
+Verify:
 ```
-Test-Path dist\assets\cellari_logo_256.png
 Test-Path dist\assets\cellari_logo.ico
 ```
 
-Both should be `True`. The PNG should be ~256x256 with transparent background; the ICO should be readable by Windows (right-click → Properties shows multiple sizes).
-
-If Inkscape is not installed, the script fails with a clear instruction — install Inkscape from inkscape.org and re-run.
+Should be `True`. Open the ICO in Explorer (right-click → Properties → Details) — it should be recognized as a valid Windows icon. Optionally view it in Paint or any image tool.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add scripts/convert-icon.ps1 dist/assets/cellari_logo_256.png dist/assets/cellari_logo.ico
-git commit -m "Add Cellari logo rasters (PNG 256, multi-size ICO) generated from SVG"
+git add scripts/convert-icon.ps1 dist/assets/cellari_logo.png dist/assets/cellari_logo.ico
+git commit -m "Add Cellari logo PNG + generated multi-size ICO"
 ```
+
+(Include the user-supplied `cellari_logo.png` in the same commit — it is also untracked.)
 
 ---
 
@@ -151,7 +146,7 @@ $src = Join-Path $root "src\DuvcApi\Program.cs"
 $assemblyInfo = Join-Path $root "src\DuvcApi\AssemblyInfo.cs"
 $duvcCli = Join-Path $root "bin\duvc-cli.exe"
 $dist = Join-Path $root "dist"
-$logoPng = Join-Path $root "dist\assets\cellari_logo_256.png"
+$logoPng = Join-Path $root "dist\assets\cellari_logo.png"
 $logoIco = Join-Path $root "dist\assets\cellari_logo.ico"
 
 if (-not (Test-Path $src)) {
@@ -192,7 +187,7 @@ $output = Join-Path $dist "duvc-api.exe"
     /win32icon:$logoIco `
     /out:$output `
     /resource:$duvcCli,duvc-cli.exe `
-    /resource:$logoPng,cellari_logo_256.png `
+    /resource:$logoPng,cellari_logo.png `
     /resource:$logoIco,cellari_logo.ico `
     /reference:System.ServiceProcess.dll `
     /reference:System.Windows.Forms.dll `
@@ -219,8 +214,8 @@ Quick smoke that resources made it in:
 ```powershell
 $bytes = [IO.File]::ReadAllBytes("dist\duvc-api.exe")
 $text  = [Text.Encoding]::ASCII.GetString($bytes)
-$text.Contains("cellari_logo_256.png")   # should be True
-$text.Contains("cellari_logo.ico")       # should be True
+$text.Contains("cellari_logo.png")    # should be True
+$text.Contains("cellari_logo.ico")    # should be True
 ```
 
 Also verify Explorer shows the new icon for `dist\duvc-api.exe`.
@@ -497,7 +492,7 @@ internal sealed class ControlPanelForm : Form
             Margin = new Padding(0, 0, 8, 0),
             BackColor = Color.Transparent
         };
-        try { pic.Image = EmbeddedAssets.LoadPng("cellari_logo_256.png"); }
+        try { pic.Image = EmbeddedAssets.LoadPng("cellari_logo.png"); }
         catch (Exception ex) { Logger.Error("Control Panel logo load failed: " + ex.Message); }
         panel.Controls.Add(pic, 0, 0);
         panel.SetRowSpan(pic, 2);
