@@ -83,6 +83,25 @@ namespace DuvcApi
             return string.IsNullOrWhiteSpace(name) ? DefaultCameraName : name.Trim();
         }
 
+        // Pick the configured camera if it is among the connected devices.
+        // Otherwise fall back to the first attached UVC device so the API works
+        // out of the box on machines that do not expose a "USB Camera" by that
+        // exact name. Returns the configured name unchanged when no devices are
+        // present so error payloads still show what was looked for.
+        public static string ResolveCameraName(string configured, IList<CameraDevice> devices)
+        {
+            if (devices != null && devices.Count > 0)
+            {
+                if (!string.IsNullOrWhiteSpace(configured)
+                    && DuvcCli.FindDeviceIndex(devices, configured).HasValue)
+                {
+                    return configured;
+                }
+                return devices[0].name;
+            }
+            return configured;
+        }
+
         public static int GetPort()
         {
             var env = Environment.GetEnvironmentVariable("DUVC_API_PORT");
@@ -733,14 +752,16 @@ namespace DuvcApi
             try
             {
                 var devices = DuvcCli.ListDevices();
-                var index = DuvcCli.FindDeviceIndex(devices, _cameraName);
+                var resolved = Program.ResolveCameraName(_cameraName, devices);
+                var index = DuvcCli.FindDeviceIndex(devices, resolved);
                 var cameraFound = index.HasValue;
                 var payload = new
                 {
                     ok = true,
                     status = cameraFound ? "ready" : "missing",
                     cameraFound,
-                    cameraName = _cameraName,
+                    cameraName = resolved,
+                    cameraNameConfigured = _cameraName,
                     cameraIndex = index,
                     appVersion = Program.GetVersionLabel(),
                     devices
@@ -991,7 +1012,8 @@ namespace DuvcApi
             try
             {
                 var devices = DuvcCli.ListDevices(false);
-                var index = DuvcCli.FindDeviceIndex(devices, _cameraName);
+                var resolved = Program.ResolveCameraName(_cameraName, devices);
+                var index = DuvcCli.FindDeviceIndex(devices, resolved);
                 var cameraFound = index.HasValue;
                 payload = new StatusPayload
                 {
@@ -999,7 +1021,8 @@ namespace DuvcApi
                     ok = true,
                     status = cameraFound ? "ready" : "missing",
                     cameraFound = cameraFound,
-                    cameraName = _cameraName,
+                    cameraName = resolved,
+                    cameraNameConfigured = _cameraName,
                     cameraIndex = index,
                     wsClients = _webSockets.ClientCount,
                     timestamp = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)
@@ -1016,6 +1039,7 @@ namespace DuvcApi
                     status = "error",
                     cameraFound = false,
                     cameraName = _cameraName,
+                    cameraNameConfigured = _cameraName,
                     cameraIndex = null,
                     wsClients = _webSockets.ClientCount,
                     timestamp = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
@@ -2601,6 +2625,7 @@ namespace DuvcApi
         public string status { get; set; }
         public bool cameraFound { get; set; }
         public string cameraName { get; set; }
+        public string cameraNameConfigured { get; set; }
         public int? cameraIndex { get; set; }
         public int wsClients { get; set; }
         public string timestamp { get; set; }
@@ -3204,6 +3229,8 @@ namespace DuvcApi
             StartPosition = FormStartPosition.CenterScreen;
             ShowInTaskbar = true;
             WindowState = FormWindowState.Normal;
+            try { Icon = EmbeddedAssets.LoadIcon("cellari_logo.ico"); }
+            catch (Exception ex) { Logger.Error("Log icon load failed: " + ex.Message); }
 
             _textBox = new TextBox
             {
@@ -4484,6 +4511,12 @@ namespace DuvcApi
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100f));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            // Explicit row heights: the log-file row hosts a Button that is taller
+            // than the surrounding Labels and was being vertically clipped under
+            // AutoSize-to-smallest behaviour.
+            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f));
 
             var monoFont = new Font("Consolas", 9f);
 
@@ -4498,8 +4531,14 @@ namespace DuvcApi
             grid.Controls.Add(_openStateFolderLink, 2, 1);
 
             grid.Controls.Add(NewBodyLabel("Log file:"), 0, 2);
-            grid.Controls.Add(new Label { Text = Paths.LogFile, Font = monoFont, AutoSize = true, Margin = new Padding(0, 4, 8, 4) }, 1, 2);
-            var logActions = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, AutoSize = true };
+            grid.Controls.Add(new Label { Text = Paths.LogFile, Font = monoFont, AutoSize = true, Margin = new Padding(0, 8, 8, 0), TextAlign = System.Drawing.ContentAlignment.MiddleLeft }, 1, 2);
+            var logActions = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                AutoSize = true,
+                Margin = new Padding(0, 4, 0, 0),
+                Padding = new Padding(0)
+            };
             _openLogFolderLink = NewOpenFolderLink(Paths.LogFile);
             _showLogBtn = new Button { Text = "Show Log", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2) };
             _showLogBtn.Click += (s, e) => _tray.ShowLogFromControlPanel();
