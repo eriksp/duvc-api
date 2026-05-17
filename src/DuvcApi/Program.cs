@@ -1859,6 +1859,9 @@ namespace DuvcApi
         private ToolStripMenuItem _updateItem;
         private System.Threading.Timer _updateCheckTimer;
         private volatile bool _firstUpdateCheckDone;
+        private readonly object _statusLock = new object();
+        private StatusResult _lastStatus;
+        private DateTime _lastStatusAt;
 
         private TrayApp(bool startServer)
         {
@@ -2002,6 +2005,11 @@ namespace DuvcApi
         private void UpdateStatus()
         {
             var status = StatusClient.Check(Program.GetPort());
+            lock (_statusLock)
+            {
+                _lastStatus = status;
+                _lastStatusAt = DateTime.UtcNow;
+            }
             var tooltip = BuildTooltip(status);
             UpdateServiceMenu(status);
             UpdateUpdateMenu();
@@ -2045,6 +2053,18 @@ namespace DuvcApi
             {
                 _lastTooltip = tooltip;
                 _notifyIcon.Text = tooltip.Length > 63 ? tooltip.Substring(0, 63) : tooltip;
+            }
+        }
+
+        internal HealthSnapshot GetHealthSnapshot()
+        {
+            lock (_statusLock)
+            {
+                return new HealthSnapshot
+                {
+                    Status = _lastStatus,
+                    CheckedAt = _lastStatusAt
+                };
             }
         }
 
@@ -2401,6 +2421,12 @@ namespace DuvcApi
         public int WsClients { get; set; }
         public bool ServiceInstalled { get; set; }
         public bool ServiceRunning { get; set; }
+    }
+
+    internal sealed class HealthSnapshot
+    {
+        public StatusResult Status { get; set; }
+        public DateTime CheckedAt { get; set; }
     }
 
     internal static class StatusClient
