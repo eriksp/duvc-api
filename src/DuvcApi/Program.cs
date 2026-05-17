@@ -4114,7 +4114,18 @@ namespace DuvcApi
                 {
                     throw new InvalidOperationException("Embedded resource not found: " + resourceName);
                 }
-                return new Icon(stream);
+                // Icon(Stream) can defer reading sub-image data for multi-size ICOs whose
+                // entries are PNG payloads. Buffer the whole stream and Clone() so the
+                // returned Icon owns an independent handle and we can dispose the stream.
+                using (var ms = new MemoryStream())
+                {
+                    stream.CopyTo(ms);
+                    ms.Position = 0;
+                    using (var tmp = new Icon(ms))
+                    {
+                        return (Icon)tmp.Clone();
+                    }
+                }
             }
         }
     }
