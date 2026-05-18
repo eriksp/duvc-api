@@ -1598,10 +1598,34 @@ namespace DuvcApi
         {
             try
             {
-                bool createdNew;
-                _mutex = new Mutex(true, MutexName, out createdNew);
-                IsOwner = createdNew;
-                return createdNew;
+                // Drop any handle from a previous failed Acquire so this call
+                // can claim ownership cleanly (e.g. after KillOtherInstances).
+                if (_mutex != null)
+                {
+                    try { _mutex.Close(); } catch { }
+                    _mutex = null;
+                }
+                IsOwner = false;
+                var mutex = new Mutex(false, MutexName);
+                bool acquired;
+                try
+                {
+                    acquired = mutex.WaitOne(TimeSpan.Zero, false);
+                }
+                catch (AbandonedMutexException)
+                {
+                    // Previous owner was killed before releasing -- WaitOne
+                    // returned ownership to us alongside the exception.
+                    acquired = true;
+                }
+                if (acquired)
+                {
+                    _mutex = mutex;
+                    IsOwner = true;
+                    return true;
+                }
+                try { mutex.Close(); } catch { }
+                return false;
             }
             catch
             {
@@ -1616,9 +1640,10 @@ namespace DuvcApi
             {
                 if (_mutex != null && IsOwner)
                 {
-                    _mutex.ReleaseMutex();
+                    try { _mutex.ReleaseMutex(); } catch { }
                     _mutex.Dispose();
                     _mutex = null;
+                    IsOwner = false;
                 }
             }
             catch
@@ -4324,8 +4349,9 @@ namespace DuvcApi
         private Label _modeLabel;
         private StatusBullet _camerasBullet, _watchdogBullet, _serviceBullet;
         private Label _camerasLabel, _watchdogLabel, _serviceStatusLabel;
-        private Button _installBtn, _uninstallBtn, _startWatchdogBtn;
-        private Button _showHealthBtn, _showLogBtn;
+        private LinkLabel _installLink, _uninstallLink, _startWatchdogLink;
+        private LinkLabel _showHealthLink, _showLogLink;
+        private Label _svcSep1, _svcSep2;
         private LinkLabel _openExeFolderLink, _openStateFolderLink, _openLogFolderLink;
 
         public ControlPanelForm(TrayApp tray, AutoUpdater updater)
@@ -4435,18 +4461,21 @@ namespace DuvcApi
         }
 
         // -- Health ---------------------------------------------------------
-        // Three rows (bullet | text | actions):
-        //   Cameras   + [Show /health response] [Show Log]
+        // Three rows (bullet | text | inline links):
+        //   Cameras   ·   Show /health response   Show Log
         //   Watchdog  (no actions)
-        //   Service   + [Install] [Uninstall] [Start Watchdog]
+        //   Service   ·   Install   Uninstall   Start Watchdog (only when stopped)
+        // Inline LinkLabels instead of Buttons -- they don't enforce a tall
+        // baseline so the grid rows stay tight and the GroupBox sizes correctly.
         private Control BuildHealthSection()
         {
             var box = NewGroupBox("Health");
             var grid = new TableLayoutPanel
             {
-                Dock = DockStyle.Fill,
+                Dock = DockStyle.Top,
                 ColumnCount = 3,
                 AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 Padding = new Padding(8)
             };
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 24f));
@@ -4458,15 +4487,7 @@ namespace DuvcApi
 
             // Row 1: cameras
             _camerasBullet = new StatusBullet();
-            _camerasLabel = new Label
-            {
-                Text = "Cameras: —",
-                AutoSize = false,
-                Dock = DockStyle.Fill,
-                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-                Margin = new Padding(0),
-                Height = 28
-            };
+            _camerasLabel = NewBodyLabel("Cameras: —");
             grid.Controls.Add(_camerasBullet, 0, 0);
             grid.Controls.Add(_camerasLabel,  1, 0);
 
@@ -4474,43 +4495,27 @@ namespace DuvcApi
             {
                 FlowDirection = FlowDirection.LeftToRight,
                 AutoSize = true,
-                Margin = new Padding(0),
-                Padding = new Padding(0)
+                Margin = new Padding(8, 4, 0, 4),
+                Padding = new Padding(0),
+                WrapContents = false
             };
-            _showHealthBtn = new Button { Text = "Show /health response", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
-            _showHealthBtn.Click += (s, e) => ShowHealthResponseDialog();
-            _showLogBtn = new Button { Text = "Show Log", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2) };
-            _showLogBtn.Click += (s, e) => _tray.ShowLogFromControlPanel();
-            camActions.Controls.Add(_showHealthBtn);
-            camActions.Controls.Add(_showLogBtn);
+            _showHealthLink = NewActionLink("Show /health response", ShowHealthResponseDialog);
+            _showLogLink    = NewActionLink("Show Log", () => _tray.ShowLogFromControlPanel());
+            camActions.Controls.Add(_showHealthLink);
+            camActions.Controls.Add(NewSeparatorLabel());
+            camActions.Controls.Add(_showLogLink);
             grid.Controls.Add(camActions, 2, 0);
 
             // Row 2: watchdog
             _watchdogBullet = new StatusBullet();
-            _watchdogLabel = new Label
-            {
-                Text = "Watchdog: —",
-                AutoSize = false,
-                Dock = DockStyle.Fill,
-                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-                Margin = new Padding(0),
-                Height = 28
-            };
+            _watchdogLabel = NewBodyLabel("Watchdog: —");
             grid.Controls.Add(_watchdogBullet, 0, 1);
             grid.Controls.Add(_watchdogLabel,  1, 1);
             // No actions in column 2 for watchdog row.
 
             // Row 3: service
             _serviceBullet = new StatusBullet();
-            _serviceStatusLabel = new Label
-            {
-                Text = "Service: —",
-                AutoSize = false,
-                Dock = DockStyle.Fill,
-                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-                Margin = new Padding(0),
-                Height = 28
-            };
+            _serviceStatusLabel = NewBodyLabel("Service: —");
             grid.Controls.Add(_serviceBullet,       0, 2);
             grid.Controls.Add(_serviceStatusLabel,  1, 2);
 
@@ -4518,22 +4523,54 @@ namespace DuvcApi
             {
                 FlowDirection = FlowDirection.LeftToRight,
                 AutoSize = true,
-                Margin = new Padding(0),
-                Padding = new Padding(0)
+                Margin = new Padding(8, 4, 0, 4),
+                Padding = new Padding(0),
+                WrapContents = false
             };
-            _installBtn = new Button { Text = "Install Service", AutoSize = true, Padding = new Padding(8, 2, 8, 2) };
-            _installBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("install");
-            _uninstallBtn = new Button { Text = "Uninstall Service", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2) };
-            _uninstallBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("uninstall");
-            _startWatchdogBtn = new Button { Text = "Start Watchdog", AutoSize = true, Margin = new Padding(8, 0, 0, 0), Padding = new Padding(8, 2, 8, 2), Visible = false };
-            _startWatchdogBtn.Click += (s, e) => _tray.RunElevatedFromControlPanel("startservice");
-            svcActions.Controls.Add(_installBtn);
-            svcActions.Controls.Add(_uninstallBtn);
-            svcActions.Controls.Add(_startWatchdogBtn);
+            _installLink        = NewActionLink("Install Service",   () => _tray.RunElevatedFromControlPanel("install"));
+            _uninstallLink      = NewActionLink("Uninstall Service", () => _tray.RunElevatedFromControlPanel("uninstall"));
+            _startWatchdogLink  = NewActionLink("Start Watchdog",    () => _tray.RunElevatedFromControlPanel("startservice"));
+            _startWatchdogLink.Visible = false;
+            _svcSep1 = NewSeparatorLabel();
+            _svcSep2 = NewSeparatorLabel();
+            _svcSep2.Visible = false;
+            svcActions.Controls.Add(_installLink);
+            svcActions.Controls.Add(_svcSep1);
+            svcActions.Controls.Add(_uninstallLink);
+            svcActions.Controls.Add(_svcSep2);
+            svcActions.Controls.Add(_startWatchdogLink);
             grid.Controls.Add(svcActions, 2, 2);
 
             box.Controls.Add(grid);
             return box;
+        }
+
+        private static LinkLabel NewActionLink(string text, Action onClick)
+        {
+            var link = new LinkLabel
+            {
+                Text = text,
+                AutoSize = true,
+                Margin = new Padding(0, 0, 0, 0),
+                LinkBehavior = LinkBehavior.HoverUnderline
+            };
+            link.LinkClicked += (s, e) =>
+            {
+                try { onClick(); }
+                catch (Exception ex) { Logger.Error("Link action failed: " + ex.Message); }
+            };
+            return link;
+        }
+
+        private static Label NewSeparatorLabel()
+        {
+            return new Label
+            {
+                Text = "·",
+                AutoSize = true,
+                ForeColor = SystemColors.GrayText,
+                Margin = new Padding(6, 0, 6, 0)
+            };
         }
 
         private void ShowHealthResponseDialog()
@@ -4910,25 +4947,31 @@ namespace DuvcApi
             {
                 _serviceBullet.SetColor(NaColor);
                 _serviceStatusLabel.Text = "Service: Not installed";
-                _installBtn.Enabled = true;
-                _uninstallBtn.Enabled = false;
-                _startWatchdogBtn.Visible = false;
+                _installLink.Visible = true;
+                _uninstallLink.Visible = false;
+                _svcSep1.Visible = false;
+                _startWatchdogLink.Visible = false;
+                _svcSep2.Visible = false;
             }
             else if (svc.IsRunning)
             {
                 _serviceBullet.SetColor(OkColor);
                 _serviceStatusLabel.Text = "Service: Running";
-                _installBtn.Enabled = false;
-                _uninstallBtn.Enabled = true;
-                _startWatchdogBtn.Visible = false;
+                _installLink.Visible = false;
+                _uninstallLink.Visible = true;
+                _svcSep1.Visible = false;
+                _startWatchdogLink.Visible = false;
+                _svcSep2.Visible = false;
             }
             else
             {
                 _serviceBullet.SetColor(WarnColor);
                 _serviceStatusLabel.Text = "Service: Installed, stopped";
-                _installBtn.Enabled = false;
-                _uninstallBtn.Enabled = true;
-                _startWatchdogBtn.Visible = true;
+                _installLink.Visible = false;
+                _uninstallLink.Visible = true;
+                _svcSep1.Visible = false;
+                _startWatchdogLink.Visible = true;
+                _svcSep2.Visible = true;
             }
         }
     }
