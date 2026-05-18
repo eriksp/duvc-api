@@ -1904,6 +1904,7 @@ namespace DuvcApi
         private StatusResult _lastStatus;
         private DateTime _lastStatusAt;
         private ControlPanelForm _controlPanel;
+        private string _apiStartError;
 
         private TrayApp(bool startServer)
         {
@@ -1923,7 +1924,7 @@ namespace DuvcApi
                 catch (Exception ex)
                 {
                     Logger.Error("Tray API start failed: " + ex.Message);
-                    MessageBox.Show("Failed to start API: " + ex.Message, "DUVC API", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    _apiStartError = ex.Message;
                 }
             }
 
@@ -1993,6 +1994,115 @@ namespace DuvcApi
             // The installed service (not this process) performs auto-apply.
             _updateCheckTimer = new System.Threading.Timer(
                 OnUpdateCheckTick, null, TimeSpan.FromSeconds(60), TimeSpan.FromMinutes(60));
+
+            // Surface startup problems immediately. If the API failed to start
+            // (typically a port conflict with the installed service or a stale
+            // tray instance), let the user open the Control Panel to clean up
+            // or exit. Otherwise open the Control Panel so the user lands on the
+            // health/service overview without an extra click.
+            if (!string.IsNullOrEmpty(_apiStartError))
+            {
+                if (!ShowStartupErrorDialog(_apiStartError))
+                {
+                    ExitThread();
+                    return;
+                }
+            }
+            ShowControlPanel();
+        }
+
+        private bool ShowStartupErrorDialog(string apiError)
+        {
+            var lines = new List<string>();
+            lines.Add("The API failed to start on port " + Program.GetPort() + ".");
+            lines.Add("");
+            lines.Add("Detail: " + (apiError ?? "(unknown)"));
+            lines.Add("");
+
+            try
+            {
+                var svc = ServiceStatusHelper.GetStatus(Program.ServiceNameConst);
+                if (svc.IsInstalled && svc.IsRunning)
+                {
+                    lines.Add("Likely cause: the DuvcApi service is running and is");
+                    lines.Add("already serving the API on this port. Use the Control");
+                    lines.Add("Panel to uninstall the service if you want to run");
+                    lines.Add("standalone instead.");
+                    lines.Add("");
+                }
+                else if (svc.IsInstalled)
+                {
+                    lines.Add("The DuvcApi service is installed but stopped.");
+                    lines.Add("");
+                }
+
+                var thisPid = Process.GetCurrentProcess().Id;
+                var others = new List<int>();
+                foreach (var p in Process.GetProcessesByName("duvc-api"))
+                {
+                    try { if (p.Id != thisPid) others.Add(p.Id); } catch { }
+                    finally { try { p.Dispose(); } catch { } }
+                }
+                if (others.Count > 0)
+                {
+                    lines.Add("Other duvc-api.exe processes detected (PIDs: " + string.Join(", ", others.ConvertAll(i => i.ToString(CultureInfo.InvariantCulture)).ToArray()) + ").");
+                    lines.Add("");
+                }
+            }
+            catch { }
+
+            lines.Add("Open the Control Panel to manage the install, or exit.");
+
+            using (var dlg = new Form
+            {
+                Text = Program.AppTitle + " — Startup error",
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterScreen,
+                ClientSize = new Size(520, 320),
+                MinimizeBox = false,
+                MaximizeBox = false,
+                ShowInTaskbar = true,
+                Font = new Font("Segoe UI", 9f)
+            })
+            {
+                try { dlg.Icon = EmbeddedAssets.LoadIcon("cellari_logo.ico"); } catch { }
+
+                var text = new TextBox
+                {
+                    Multiline = true,
+                    ReadOnly = true,
+                    ScrollBars = ScrollBars.Vertical,
+                    BorderStyle = BorderStyle.None,
+                    BackColor = SystemColors.Window,
+                    Dock = DockStyle.Fill,
+                    Text = string.Join(Environment.NewLine, lines.ToArray()),
+                    Margin = new Padding(16)
+                };
+                var pad = new Panel { Dock = DockStyle.Fill, Padding = new Padding(16) };
+                pad.Controls.Add(text);
+
+                var bottom = new FlowLayoutPanel
+                {
+                    FlowDirection = FlowDirection.RightToLeft,
+                    Dock = DockStyle.Bottom,
+                    AutoSize = true,
+                    Padding = new Padding(8)
+                };
+                var openBtn = new Button { Text = "Open Control Panel", AutoSize = true, Padding = new Padding(12, 4, 12, 4) };
+                openBtn.Click += (s, e) => { dlg.DialogResult = DialogResult.OK; dlg.Close(); };
+                var exitBtn = new Button { Text = "Exit", AutoSize = true, Padding = new Padding(12, 4, 12, 4), Margin = new Padding(8, 0, 0, 0) };
+                exitBtn.Click += (s, e) => { dlg.DialogResult = DialogResult.Cancel; dlg.Close(); };
+                bottom.Controls.Add(exitBtn);
+                bottom.Controls.Add(openBtn);
+
+                dlg.Controls.Add(pad);
+                dlg.Controls.Add(bottom);
+                dlg.AcceptButton = openBtn;
+                dlg.CancelButton = exitBtn;
+
+                var result = dlg.ShowDialog();
+                return result == DialogResult.OK;
+            }
         }
 
         public static void Run(bool startServer, bool silent)
@@ -4212,8 +4322,8 @@ namespace DuvcApi
 
         // Section refs we need to update
         private Label _modeLabel;
-        private Label _camerasLabel;
-        private Label _serviceStatusLabel;
+        private StatusBullet _camerasBullet, _watchdogBullet, _serviceBullet;
+        private Label _camerasLabel, _watchdogLabel, _serviceStatusLabel;
         private Button _installBtn, _uninstallBtn, _startWatchdogBtn;
         private Button _showHealthBtn, _showLogBtn;
         private LinkLabel _openExeFolderLink, _openStateFolderLink, _openLogFolderLink;
@@ -4325,33 +4435,40 @@ namespace DuvcApi
         }
 
         // -- Health ---------------------------------------------------------
-        // Two rows: cameras + actions (Show /health, Show Log); service + actions
-        // (Install/Uninstall/Start Watchdog).
+        // Three rows (bullet | text | actions):
+        //   Cameras   + [Show /health response] [Show Log]
+        //   Watchdog  (no actions)
+        //   Service   + [Install] [Uninstall] [Start Watchdog]
         private Control BuildHealthSection()
         {
             var box = NewGroupBox("Health");
             var grid = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                ColumnCount = 2,
+                ColumnCount = 3,
                 AutoSize = true,
                 Padding = new Padding(8)
             };
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 24f));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f));
-            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f));
+            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-            // Row 1: cameras  +  [Show /health response] [Show Log]
+            // Row 1: cameras
+            _camerasBullet = new StatusBullet();
             _camerasLabel = new Label
             {
                 Text = "Cameras: —",
                 AutoSize = false,
                 Dock = DockStyle.Fill,
                 TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-                Margin = new Padding(0)
+                Margin = new Padding(0),
+                Height = 28
             };
-            grid.Controls.Add(_camerasLabel, 0, 0);
+            grid.Controls.Add(_camerasBullet, 0, 0);
+            grid.Controls.Add(_camerasLabel,  1, 0);
 
             var camActions = new FlowLayoutPanel
             {
@@ -4366,18 +4483,36 @@ namespace DuvcApi
             _showLogBtn.Click += (s, e) => _tray.ShowLogFromControlPanel();
             camActions.Controls.Add(_showHealthBtn);
             camActions.Controls.Add(_showLogBtn);
-            grid.Controls.Add(camActions, 1, 0);
+            grid.Controls.Add(camActions, 2, 0);
 
-            // Row 2: service status  +  [Install] [Uninstall] [Start Watchdog]
+            // Row 2: watchdog
+            _watchdogBullet = new StatusBullet();
+            _watchdogLabel = new Label
+            {
+                Text = "Watchdog: —",
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
+                Margin = new Padding(0),
+                Height = 28
+            };
+            grid.Controls.Add(_watchdogBullet, 0, 1);
+            grid.Controls.Add(_watchdogLabel,  1, 1);
+            // No actions in column 2 for watchdog row.
+
+            // Row 3: service
+            _serviceBullet = new StatusBullet();
             _serviceStatusLabel = new Label
             {
                 Text = "Service: —",
                 AutoSize = false,
                 Dock = DockStyle.Fill,
                 TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-                Margin = new Padding(0)
+                Margin = new Padding(0),
+                Height = 28
             };
-            grid.Controls.Add(_serviceStatusLabel, 0, 1);
+            grid.Controls.Add(_serviceBullet,       0, 2);
+            grid.Controls.Add(_serviceStatusLabel,  1, 2);
 
             var svcActions = new FlowLayoutPanel
             {
@@ -4395,7 +4530,7 @@ namespace DuvcApi
             svcActions.Controls.Add(_installBtn);
             svcActions.Controls.Add(_uninstallBtn);
             svcActions.Controls.Add(_startWatchdogBtn);
-            grid.Controls.Add(svcActions, 1, 1);
+            grid.Controls.Add(svcActions, 2, 2);
 
             box.Controls.Add(grid);
             return box;
@@ -4736,44 +4871,61 @@ namespace DuvcApi
                 var devices = DuvcCli.ListDevices(false);
                 if (devices == null || devices.Count == 0)
                 {
+                    _camerasBullet.SetColor(BadColor);
                     _camerasLabel.Text = "Cameras: none detected";
-                    _camerasLabel.ForeColor = BadColor;
                 }
                 else
                 {
                     var names = new List<string>(devices.Count);
                     foreach (var d in devices) names.Add(d.name);
+                    _camerasBullet.SetColor(OkColor);
                     _camerasLabel.Text = "Cameras (" + devices.Count + "): " + string.Join(", ", names.ToArray());
-                    _camerasLabel.ForeColor = OkColor;
                 }
             }
             catch (Exception ex)
             {
+                _camerasBullet.SetColor(BadColor);
                 _camerasLabel.Text = "Cameras: error — " + ex.Message;
-                _camerasLabel.ForeColor = BadColor;
+            }
+
+            // Watchdog row
+            if (!svc.IsInstalled)
+            {
+                _watchdogBullet.SetColor(NaColor);
+                _watchdogLabel.Text = "Watchdog: N/A — standalone mode";
+            }
+            else if (svc.IsRunning)
+            {
+                _watchdogBullet.SetColor(OkColor);
+                _watchdogLabel.Text = "Watchdog: OK";
+            }
+            else
+            {
+                _watchdogBullet.SetColor(BadColor);
+                _watchdogLabel.Text = "Watchdog: Stopped";
             }
 
             // Service row
             if (!svc.IsInstalled)
             {
+                _serviceBullet.SetColor(NaColor);
                 _serviceStatusLabel.Text = "Service: Not installed";
-                _serviceStatusLabel.ForeColor = NaColor;
                 _installBtn.Enabled = true;
                 _uninstallBtn.Enabled = false;
                 _startWatchdogBtn.Visible = false;
             }
             else if (svc.IsRunning)
             {
+                _serviceBullet.SetColor(OkColor);
                 _serviceStatusLabel.Text = "Service: Running";
-                _serviceStatusLabel.ForeColor = OkColor;
                 _installBtn.Enabled = false;
                 _uninstallBtn.Enabled = true;
                 _startWatchdogBtn.Visible = false;
             }
             else
             {
+                _serviceBullet.SetColor(WarnColor);
                 _serviceStatusLabel.Text = "Service: Installed, stopped";
-                _serviceStatusLabel.ForeColor = WarnColor;
                 _installBtn.Enabled = false;
                 _uninstallBtn.Enabled = true;
                 _startWatchdogBtn.Visible = true;
