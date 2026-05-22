@@ -1788,8 +1788,8 @@ namespace DuvcApi
                 {
                     Directory.CreateDirectory(dir);
                 }
-                // Grant BUILTIN\Users Modify so the kiosk user can write update.request.
-                // S-1-5-32-545 = BUILTIN\Users (locale-independent).
+                // Grant BUILTIN\Users Modify so the kiosk user can write the log
+                // and update.request. S-1-5-32-545 = BUILTIN\Users (locale-independent).
                 var psi = new ProcessStartInfo
                 {
                     FileName = "icacls.exe",
@@ -1810,6 +1810,26 @@ namespace DuvcApi
             catch (Exception ex)
             {
                 Console.Error.WriteLine("Failed to prepare state directory: " + ex.Message);
+            }
+            RemoveLegacyStateDir();
+        }
+
+        // Delete the pre-2026-05 %ProgramData%\DuvcApi directory if it lingers.
+        // State now lives alongside the exe; the old location is not migrated.
+        internal static void RemoveLegacyStateDir()
+        {
+            try
+            {
+                var legacy = Paths.LegacyStateDir;
+                if (Directory.Exists(legacy))
+                {
+                    Directory.Delete(legacy, true);
+                    Logger.Info("Removed legacy state directory: " + legacy);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Info("Could not remove legacy state directory: " + ex.Message);
             }
         }
 
@@ -1954,6 +1974,7 @@ namespace DuvcApi
             }
 
             TryStartWatchdogIfInstalled();
+            ServiceInstaller.RemoveLegacyStateDir();
 
             _okIcon = TrayIconFactory.CreateStatusIcon(Color.FromArgb(0, 200, 0));
             _warnIcon = TrayIconFactory.CreateStatusIcon(Color.FromArgb(220, 180, 0));
@@ -3050,9 +3071,18 @@ namespace DuvcApi
 
     internal static class Paths
     {
-        // Users-writable state directory created by `install`. Holds the update
-        // request file (IPC) plus the existing log/settings files.
+        // State lives alongside the exe (e.g. C:\Kiosk) so the whole install is
+        // inspectable from one folder. Holds the log, settings, and the update
+        // request IPC file. The exe-dir is ACL'd for BUILTIN\Users:Modify during
+        // `install` so a non-admin kiosk user can still write here.
         public static string StateDir
+        {
+            get { return Path.GetDirectoryName(CurrentExe); }
+        }
+
+        // Pre-2026-05 builds kept state under %ProgramData%\DuvcApi. Retained so
+        // RemoveLegacyStateDir can find and delete the orphaned directory.
+        public static string LegacyStateDir
         {
             get
             {
@@ -3999,10 +4029,7 @@ namespace DuvcApi
 
     internal static class SettingsStore
     {
-        private static readonly string SettingsPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-            "DuvcApi",
-            "settings.json");
+        private static readonly string SettingsPath = Path.Combine(Paths.StateDir, "settings.json");
 
         public static bool LoadUseWebSocket()
         {
@@ -4366,7 +4393,7 @@ namespace DuvcApi
             MaximizeBox = true;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(760, 760);
+            ClientSize = new Size(760, 500);
             MinimumSize = new Size(640, 480);
             BackColor = SystemColors.Window;
             Font = new Font("Segoe UI", 9f);
@@ -4396,8 +4423,6 @@ namespace DuvcApi
             root.Controls.Add(BuildHeader());
             root.Controls.Add(BuildHealthSection());
             root.Controls.Add(BuildPathsSection());
-            root.Controls.Add(BuildAboutSection());
-            root.Controls.Add(BuildFooter());
 
             scrollHost.Controls.Add(root);
             Controls.Add(scrollHost);
@@ -4419,7 +4444,7 @@ namespace DuvcApi
             var panel = new TableLayoutPanel
             {
                 ColumnCount = 2,
-                RowCount = 2,
+                RowCount = 3,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 Margin = new Padding(0, 0, 0, 12)
@@ -4437,7 +4462,7 @@ namespace DuvcApi
             try { pic.Image = EmbeddedAssets.LoadPng("cellari_logo.png"); }
             catch (Exception ex) { Logger.Error("Control Panel logo load failed: " + ex.Message); }
             panel.Controls.Add(pic, 0, 0);
-            panel.SetRowSpan(pic, 2);
+            panel.SetRowSpan(pic, 3);
 
             var title = new Label
             {
@@ -4456,6 +4481,19 @@ namespace DuvcApi
                 Margin = new Padding(0, 4, 0, 0)
             };
             panel.Controls.Add(_modeLabel, 1, 1);
+
+            var links = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                AutoSize = true,
+                Margin = new Padding(0, 4, 0, 0),
+                Padding = new Padding(0),
+                WrapContents = false
+            };
+            links.Controls.Add(NewExternalLink("github.com/eriksp/duvc-api", "https://github.com/eriksp/duvc-api"));
+            links.Controls.Add(NewSeparatorLabel());
+            links.Controls.Add(NewExternalLink("github.com/allanhanan/duvc-ctl", "https://github.com/allanhanan/duvc-ctl"));
+            panel.Controls.Add(links, 1, 2);
 
             return panel;
         }
@@ -4800,8 +4838,24 @@ namespace DuvcApi
 
             grid.Controls.Add(NewBodyLabel("Log file:"), 0, 2);
             grid.Controls.Add(new Label { Text = Paths.LogFile, Font = monoFont, AutoSize = true, Margin = new Padding(0, 4, 8, 4) }, 1, 2);
+            var logActions = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                AutoSize = true,
+                WrapContents = false,
+                Margin = new Padding(0, 4, 0, 4),
+                Padding = new Padding(0)
+            };
             _openLogFolderLink = NewOpenFolderLink(Paths.LogFile);
-            grid.Controls.Add(_openLogFolderLink, 2, 2);
+            var openInNotepad = NewActionLink("Open in Notepad", () =>
+            {
+                try { Process.Start("notepad.exe", Paths.LogFile); }
+                catch (Exception ex) { Logger.Error("Open log in Notepad failed: " + ex.Message); }
+            });
+            logActions.Controls.Add(_openLogFolderLink);
+            logActions.Controls.Add(NewSeparatorLabel());
+            logActions.Controls.Add(openInNotepad);
+            grid.Controls.Add(logActions, 2, 2);
 
             box.Controls.Add(grid);
             return box;
@@ -4844,25 +4898,6 @@ namespace DuvcApi
         }
 
         // -- About ----------------------------------------------------------
-        private Control BuildAboutSection()
-        {
-            var box = NewGroupBox("About");
-            var stack = new TableLayoutPanel
-            {
-                Dock = DockStyle.Fill,
-                ColumnCount = 1,
-                AutoSize = true,
-                Padding = new Padding(8)
-            };
-
-            stack.Controls.Add(NewBodyLabel("DUVC API — Cellari kiosk camera control"));
-            stack.Controls.Add(NewExternalLink("github.com/eriksp/duvc-api", "https://github.com/eriksp/duvc-api"));
-            stack.Controls.Add(NewExternalLink("duvc-cli upstream: github.com/allanhanan/duvc-ctl", "https://github.com/allanhanan/duvc-ctl"));
-
-            box.Controls.Add(stack);
-            return box;
-        }
-
         private static LinkLabel NewExternalLink(string text, string url)
         {
             var link = new LinkLabel { Text = text, AutoSize = true, Margin = new Padding(0, 2, 0, 2) };
@@ -4872,25 +4907,6 @@ namespace DuvcApi
                 catch (Exception ex) { Logger.Error("Open link failed: " + ex.Message); }
             };
             return link;
-        }
-
-        // -- Footer ---------------------------------------------------------
-        private Control BuildFooter()
-        {
-            var panel = new FlowLayoutPanel
-            {
-                FlowDirection = FlowDirection.RightToLeft,
-                Dock = DockStyle.Top,
-                AutoSize = true,
-                Padding = new Padding(0, 8, 0, 0)
-            };
-            var close = new Button { Text = "Close", AutoSize = true, Padding = new Padding(12, 2, 12, 2) };
-            close.Click += (s, e) => Close();
-            var refresh = new Button { Text = "Refresh", AutoSize = true, Padding = new Padding(12, 2, 12, 2), Margin = new Padding(8, 0, 0, 0) };
-            refresh.Click += (s, e) => RefreshAll();
-            panel.Controls.Add(close);
-            panel.Controls.Add(refresh);
-            return panel;
         }
 
         // -- Refresh --------------------------------------------------------
