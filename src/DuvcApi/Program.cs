@@ -2477,15 +2477,19 @@ namespace DuvcApi
                     _controlPanel.FormClosed += (s, e) => _controlPanel = null;
                     _controlPanel.Show();
                 }
-                else
+                if (_controlPanel.WindowState == FormWindowState.Minimized)
                 {
-                    if (_controlPanel.WindowState == FormWindowState.Minimized)
-                    {
-                        _controlPanel.WindowState = FormWindowState.Normal;
-                    }
-                    _controlPanel.BringToFront();
-                    _controlPanel.Activate();
+                    _controlPanel.WindowState = FormWindowState.Normal;
                 }
+                // The tray process is launched detached (by the service or via
+                // `start`), so it lacks foreground-activation rights and the
+                // window would otherwise open behind other apps. The brief
+                // TopMost toggle forces it to the foreground.
+                _controlPanel.Show();
+                _controlPanel.BringToFront();
+                _controlPanel.Activate();
+                _controlPanel.TopMost = true;
+                _controlPanel.TopMost = false;
             }
             catch (Exception ex)
             {
