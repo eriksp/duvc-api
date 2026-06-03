@@ -1930,6 +1930,7 @@ namespace DuvcApi
     {
         private static readonly TrayInstanceGuard InstanceGuard = new TrayInstanceGuard();
         private readonly NotifyIcon _notifyIcon;
+        private TaskbarCreatedListener _taskbarListener;
         private readonly System.Windows.Forms.Timer _timer;
         private Icon _okIcon;
         private Icon _warnIcon;
@@ -1987,6 +1988,25 @@ namespace DuvcApi
                 Visible = true,
                 Text = Program.AppTitle
             };
+
+            // Re-add the tray icon whenever Explorer (re)creates the taskbar.
+            // The first add in this constructor races Explorer at boot when the
+            // service spawns us via CreateProcessAsUser; without this hook the
+            // icon never appears until the process is restarted.
+            _taskbarListener = new TaskbarCreatedListener();
+            _taskbarListener.TaskbarCreated += ReassertNotifyIcon;
+
+            // Belt-and-suspenders: if our first Visible=true above was rejected
+            // and no TaskbarCreated fires (e.g. session re-attach), re-toggle
+            // once the message pump is up.
+            var bootRetry = new System.Windows.Forms.Timer { Interval = 200 };
+            bootRetry.Tick += (s, e) =>
+            {
+                bootRetry.Stop();
+                bootRetry.Dispose();
+                ReassertNotifyIcon();
+            };
+            bootRetry.Start();
 
             var menu = new ContextMenuStrip();
             menu.ShowImageMargin = false;
@@ -2265,6 +2285,24 @@ namespace DuvcApi
             }
         }
 
+        // Re-add the NotifyIcon by toggling Visible. Called on every shell
+        // TaskbarCreated broadcast and from the 200 ms boot-retry timer. The
+        // icon, tooltip, and context menu live on the managed NotifyIcon and
+        // survive the toggle; this just forces a fresh Shell_NotifyIcon NIM_ADD.
+        private void ReassertNotifyIcon()
+        {
+            try
+            {
+                _notifyIcon.Visible = false;
+                _notifyIcon.Visible = true;
+                Logger.Info("Taskbar (re)created; re-registered tray icon.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Reassert tray icon failed: " + ex.Message);
+            }
+        }
+
         // Opportunistic: if the service is installed but stopped, try to start it.
         // Succeeds silently when the user happens to be an admin; otherwise the
         // ServiceController.Start() throws InvalidOperationException (access denied)
@@ -2403,6 +2441,12 @@ namespace DuvcApi
                 _updateCheckTimer = null;
             }
             _timer.Stop();
+            if (_taskbarListener != null)
+            {
+                _taskbarListener.TaskbarCreated -= ReassertNotifyIcon;
+                _taskbarListener.Dispose();
+                _taskbarListener = null;
+            }
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
             if (_menuHost != null)
@@ -4318,6 +4362,59 @@ namespace DuvcApi
 
             response.statusCode = response.ok ? 200 : 500;
             return response;
+        }
+    }
+
+    // Hidden top-level window that listens for the Explorer-broadcast
+    // "TaskbarCreated" message. WinForms' NotifyIcon does not re-register
+    // itself after Explorer (re)builds the taskbar; we hook this so the
+    // boot-time race (service-spawned tray vs. shell startup) and any
+    // later Explorer restart still surface our icon.
+    internal sealed class TaskbarCreatedListener : NativeWindow, IDisposable
+    {
+        private static readonly int WM_TASKBARCREATED = SafeRegisterMessage("TaskbarCreated");
+
+        public event Action TaskbarCreated;
+
+        public TaskbarCreatedListener()
+        {
+            // Plain top-level invisible window. NOT message-only -- HWND_MESSAGE
+            // windows do not receive broadcast WM_* messages from the shell.
+            var cp = new CreateParams
+            {
+                Caption = "DuvcApiTaskbarWatcher",
+                X = -32000, Y = -32000, Width = 0, Height = 0,
+                Style = unchecked((int)0x80000000) // WS_POPUP
+            };
+            CreateHandle(cp);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (WM_TASKBARCREATED != 0 && m.Msg == WM_TASKBARCREATED)
+            {
+                var h = TaskbarCreated;
+                if (h != null)
+                {
+                    try { h(); }
+                    catch (Exception ex) { Logger.Error("TaskbarCreated handler failed: " + ex.Message); }
+                }
+            }
+            base.WndProc(ref m);
+        }
+
+        public void Dispose()
+        {
+            try { DestroyHandle(); } catch { }
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int RegisterWindowMessage(string lpString);
+
+        private static int SafeRegisterMessage(string name)
+        {
+            try { return RegisterWindowMessage(name); }
+            catch { return 0; }
         }
     }
 
