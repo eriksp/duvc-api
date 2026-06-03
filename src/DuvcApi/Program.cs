@@ -3388,7 +3388,7 @@ namespace DuvcApi
 
         public LogForm()
         {
-            Text = "Cellari Camera Control API - Log";
+            Text = "Cellari Camera Control API - Debugging";
             Width = 860;
             Height = 540;
             StartPosition = FormStartPosition.CenterScreen;
@@ -4393,12 +4393,11 @@ namespace DuvcApi
             SuspendLayout();
 
             Text = Program.AppTitle + " — Control Panel";
-            FormBorderStyle = FormBorderStyle.Sizable;
-            MaximizeBox = true;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(760, 500);
-            MinimumSize = new Size(640, 480);
+            ClientSize = new Size(760, 460);
             BackColor = SystemColors.Window;
             Font = new Font("Segoe UI", 9f);
 
@@ -4504,7 +4503,7 @@ namespace DuvcApi
 
         // -- Health ---------------------------------------------------------
         // Three rows (bullet | text | inline links):
-        //   Cameras   ·   Show /health response   Show Log
+        //   Cameras   ·   Show /health response   API debugging
         //   Watchdog  (no actions)
         //   Service   ·   Install   Uninstall   Start Watchdog (only when stopped)
         // Inline LinkLabels instead of Buttons -- they don't enforce a tall
@@ -4542,7 +4541,7 @@ namespace DuvcApi
                 WrapContents = false
             };
             _showHealthLink = NewActionLink("Show /health response", ShowHealthResponseDialog);
-            _showLogLink    = NewActionLink("Show Log", () => _tray.ShowLogFromControlPanel());
+            _showLogLink    = NewActionLink("API debugging", () => _tray.ShowLogFromControlPanel());
             camActions.Controls.Add(_showHealthLink);
             camActions.Controls.Add(NewSeparatorLabel());
             camActions.Controls.Add(_showLogLink);
@@ -4830,18 +4829,23 @@ namespace DuvcApi
 
             var monoFont = new Font("Consolas", 9f);
 
+            // Cap the path column so long paths don't push the column 2 actions
+            // outside the fixed-size form. Truncate from the left with a leading
+            // "..." so the filename / tail of the path stays visible.
+            const int pathColPx = 420;
+
             grid.Controls.Add(NewBodyLabel("Executable:"), 0, 0);
-            grid.Controls.Add(new Label { Text = Paths.CurrentExe, Font = monoFont, AutoSize = true, Margin = new Padding(0, 4, 8, 4) }, 1, 0);
+            grid.Controls.Add(MakePathLabel(Paths.CurrentExe, monoFont, pathColPx), 1, 0);
             _openExeFolderLink = NewOpenFolderLink(Paths.CurrentExe);
             grid.Controls.Add(_openExeFolderLink, 2, 0);
 
             grid.Controls.Add(NewBodyLabel("State dir:"), 0, 1);
-            grid.Controls.Add(new Label { Text = Paths.StateDir, Font = monoFont, AutoSize = true, Margin = new Padding(0, 4, 8, 4) }, 1, 1);
+            grid.Controls.Add(MakePathLabel(Paths.StateDir, monoFont, pathColPx), 1, 1);
             _openStateFolderLink = NewOpenFolderLink(Paths.StateDir);
             grid.Controls.Add(_openStateFolderLink, 2, 1);
 
             grid.Controls.Add(NewBodyLabel("Log file:"), 0, 2);
-            grid.Controls.Add(new Label { Text = Paths.LogFile, Font = monoFont, AutoSize = true, Margin = new Padding(0, 4, 8, 4) }, 1, 2);
+            grid.Controls.Add(MakePathLabel(Paths.LogFile, monoFont, pathColPx), 1, 2);
             var logActions = new FlowLayoutPanel
             {
                 FlowDirection = FlowDirection.LeftToRight,
@@ -4863,6 +4867,41 @@ namespace DuvcApi
 
             box.Controls.Add(grid);
             return box;
+        }
+
+        private static Label MakePathLabel(string path, Font font, int maxPixelWidth)
+        {
+            var text = TruncatePathStart(path ?? "", font, maxPixelWidth);
+            return new Label
+            {
+                Text = text,
+                Font = font,
+                AutoSize = false,
+                Width = maxPixelWidth,
+                Height = TextRenderer.MeasureText("Ag", font).Height + 6,
+                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
+                Margin = new Padding(0, 4, 8, 4),
+                AutoEllipsis = false
+            };
+        }
+
+        // Shrink a string from the left with a "..." prefix until it fits in
+        // maxPixelWidth when rendered in font. Returns the original string if it
+        // already fits, or "..." if even the ellipsis is wider than the budget.
+        private static string TruncatePathStart(string text, Font font, int maxPixelWidth)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            if (TextRenderer.MeasureText(text, font).Width <= maxPixelWidth) return text;
+            const string ellipsis = "...";
+            for (var i = 1; i < text.Length; i++)
+            {
+                var trial = ellipsis + text.Substring(i);
+                if (TextRenderer.MeasureText(trial, font).Width <= maxPixelWidth)
+                {
+                    return trial;
+                }
+            }
+            return ellipsis;
         }
 
         private static LinkLabel NewOpenFolderLink(string path)
