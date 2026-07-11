@@ -3890,24 +3890,35 @@ namespace DuvcApi
             }
             else
             {
+                var requestLabel = BuildRequestLabel(command, setRequest, wsRequest);
                 RestCommandResult result;
-                switch (command)
+                try
                 {
-                    case "set":
-                        result = ApiClient.SendSetByIndex(Program.GetPort(), index.Value, setRequest);
-                        break;
-                    case "get":
-                        result = ApiClient.SendGetByIndex(Program.GetPort(), index.Value, wsRequest.ToGetRequest());
-                        break;
-                    case "reset":
-                        result = ApiClient.SendResetByIndex(Program.GetPort(), index.Value, wsRequest.ToResetRequest());
-                        break;
-                    default:
-                        return;
+                    switch (command)
+                    {
+                        case "set":
+                            result = ApiClient.SendSetByIndex(Program.GetPort(), index.Value, setRequest);
+                            break;
+                        case "get":
+                            result = ApiClient.SendGetByIndex(Program.GetPort(), index.Value, wsRequest.ToGetRequest());
+                            break;
+                        case "reset":
+                            result = ApiClient.SendResetByIndex(Program.GetPort(), index.Value, wsRequest.ToResetRequest());
+                            break;
+                        default:
+                            return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AppendLine(string.Format(CultureInfo.InvariantCulture, "REST {0} failed: {1}", requestLabel, ex.Message));
+                    return;
                 }
 
-                var requestLabel = BuildRequestLabel(command, setRequest, wsRequest);
-                AppendLine(string.Format(CultureInfo.InvariantCulture, "REST {0} -> {1} {2}", requestLabel, result.statusCode, result.output));
+                var detail = string.IsNullOrEmpty(result.error)
+                    ? result.output
+                    : (string.IsNullOrEmpty(result.output) ? result.error : result.output + " | " + result.error);
+                AppendLine(string.Format(CultureInfo.InvariantCulture, "REST {0} -> {1} {2}", requestLabel, result.statusCode, detail));
             }
         }
 
@@ -4201,10 +4212,29 @@ namespace DuvcApi
     {
         private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
 
+        // GetResponseText returns error bodies instead of throwing, so the GET
+        // helpers must turn an {ok:false} payload back into an exception — their
+        // callers report failures via catch blocks. The command POST path
+        // (ParseResult) surfaces errors in-band instead.
+        private static void ThrowIfApiError(Dictionary<string, object> data)
+        {
+            if (data == null || !data.ContainsKey("ok"))
+            {
+                return;
+            }
+            if (Convert.ToBoolean(data["ok"], CultureInfo.InvariantCulture))
+            {
+                return;
+            }
+            var error = data.ContainsKey("error") && data["error"] != null ? data["error"].ToString() : null;
+            throw new InvalidOperationException(string.IsNullOrEmpty(error) ? "API reported an error." : error);
+        }
+
         public static string GetCapabilitiesOutput(int port)
         {
             var response = Get(string.Format(CultureInfo.InvariantCulture, "http://127.0.0.1:{0}/api/usb-camera/capabilities", port));
             var data = Json.Deserialize<Dictionary<string, object>>(response);
+            ThrowIfApiError(data);
             if (data != null && data.ContainsKey("output"))
             {
                 return data["output"] == null ? null : data["output"].ToString();
@@ -4216,6 +4246,7 @@ namespace DuvcApi
         {
             var response = Get(string.Format(CultureInfo.InvariantCulture, "http://127.0.0.1:{0}/api/camera/{1}/capabilities", port, index));
             var data = Json.Deserialize<Dictionary<string, object>>(response);
+            ThrowIfApiError(data);
             if (data != null && data.ContainsKey("output"))
             {
                 return data["output"] == null ? null : data["output"].ToString();
@@ -4227,6 +4258,7 @@ namespace DuvcApi
         {
             var response = Get(string.Format(CultureInfo.InvariantCulture, "http://127.0.0.1:{0}/api/cameras", port));
             var data = Json.Deserialize<Dictionary<string, object>>(response);
+            ThrowIfApiError(data);
             if (data != null && data.ContainsKey("devices"))
             {
                 var list = new List<CameraDevice>();
@@ -4328,10 +4360,29 @@ namespace DuvcApi
 
         private static string GetResponseText(HttpWebRequest request)
         {
-            using (var response = (HttpWebResponse)request.GetResponse())
-            using (var reader = new StreamReader(response.GetResponseStream()))
+            try
             {
-                return reader.ReadToEnd();
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream()))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
+            catch (WebException wex)
+            {
+                // The API reports failed device commands as HTTP 500 with a JSON
+                // error payload; GetResponse() throws on non-2xx, so read the
+                // payload off the exception. Transport failures (no response)
+                // still throw for callers to handle.
+                if (wex.Response == null)
+                {
+                    throw;
+                }
+                using (var response = wex.Response)
+                using (var reader = new StreamReader(response.GetResponseStream()))
+                {
+                    return reader.ReadToEnd();
+                }
             }
         }
 
