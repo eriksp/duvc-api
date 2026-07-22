@@ -177,6 +177,10 @@ $HardenDevice = if ([string]::IsNullOrWhiteSpace($hardenInput)) { $true } else {
 $wuInput = Read-Host "Disable Windows automatic updates (recommended for kiosk stability)? (Y/n)"
 $DisableWindowsUpdate = if ([string]::IsNullOrWhiteSpace($wuInput)) { $true } else { $wuInput.ToLower() -ne "n" }
 
+# Performance optimizations for low-RAM tablets (Defender tuning, services, Edge memory)
+$perfInput = Read-Host "Apply low-RAM performance optimizations (Defender tuning, disable unused services, Edge memory policies)? (Y/n)"
+$OptimizePerformance = if ([string]::IsNullOrWhiteSpace($perfInput)) { $true } else { $perfInput.ToLower() -ne "n" }
+
 # Tailscale
 $tsInput = Read-Host "Install and start Tailscale now for secure remote access? (Y/n)"
 $InstallTailscale = if ([string]::IsNullOrWhiteSpace($tsInput)) { $true } else { $tsInput.ToLower() -ne "n" }
@@ -308,7 +312,7 @@ if ($HardenDevice) {
 # --- Disable Windows automatic updates ---
 # Keeps the kiosk on a known-good OS build so a surprise feature/quality update
 # cannot reboot the device or break the camera stack mid-shift. Combines the
-# WindowsUpdate AU policy (durable) with disabling the wuauserv service.
+# WindowsUpdate AU policy (durable) with disabling the update services.
 if ($DisableWindowsUpdate) {
     try {
         Write-Host "Disabling Windows automatic updates..."
@@ -318,7 +322,30 @@ if ($DisableWindowsUpdate) {
         New-ItemProperty -Path $auPath -Name 'AUOptions'   -Value 1 -PropertyType DWord -Force | Out-Null
         try { Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue } catch {}
         try { Set-Service  -Name wuauserv -StartupType Disabled -ErrorAction SilentlyContinue } catch {}
-        Write-Host "Windows automatic updates disabled (AU policy + wuauserv service)."
+
+        # Windows actively resurrects update services: WaaS Medic (WaaSMedicSvc)
+        # re-enables wuauserv, and UpdateOrchestrator scheduled tasks restart the
+        # scan cycle. Both self-protect against Set-Service, so start types are
+        # written directly to the registry (4 = Disabled). Best-effort: some
+        # UpdateOrchestrator tasks are ACL-protected on newer builds.
+        foreach ($updSvc in 'WaaSMedicSvc', 'UsoSvc') {
+            try {
+                Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$updSvc" -Name 'Start' -Value 4 -Type DWord -ErrorAction Stop
+                Write-Host "Update service '$updSvc' start type set to Disabled."
+            } catch {
+                Write-Warning "Could not disable update service '$updSvc': $($_.Exception.Message)"
+            }
+        }
+        $updateTasks = @(
+            '\Microsoft\Windows\UpdateOrchestrator\Schedule Scan',
+            '\Microsoft\Windows\UpdateOrchestrator\Schedule Scan Static Task',
+            '\Microsoft\Windows\WindowsUpdate\Scheduled Start'
+        )
+        foreach ($updTask in $updateTasks) {
+            schtasks /Change /TN "$updTask" /Disable 2>$null | Out-Null
+        }
+
+        Write-Host "Windows automatic updates disabled (AU policy + wuauserv/WaaSMedic/UsoSvc + orchestrator tasks)."
     } catch {
         Write-Warning "Failed to disable Windows Update: $($_.Exception.Message)"
     }
@@ -402,22 +429,206 @@ Set-RegDword -Path $HKLM_EdgePolicies -Name 'SearchForImageEnabled' -Value 0
 # Old Discover policy is deprecated but set defensively (no harm if ignored)
 Set-RegDword -Path $HKLM_EdgePolicies -Name 'EdgeDiscoverEnabled' -Value 0
 
+# --- Kiosk escape hardening (security review 2026-07-12) ---
+# The single most common kiosk breakout is a native file dialog: a download
+# "Save As", a print "Save as PDF", an <input type=file> upload picker, or a
+# long-press "Save image as" all open a comdlg32 window whose filename box is a
+# mini File Explorer -- a touchscreen user can type C:\ , browse the disk, and
+# right-click->Open an executable to reach a shell. AllowFileSelectionDialogs=0
+# makes Edge cancel every one of those dialogs.
+Set-RegDword -Path $HKLM_EdgePolicies -Name 'AllowFileSelectionDialogs' -Value 0
+# Belt-and-braces around the same vector: no printing, block all downloads.
+Set-RegDword -Path $HKLM_EdgePolicies -Name 'PrintingEnabled' -Value 0
+Set-RegDword -Path $HKLM_EdgePolicies -Name 'DownloadRestrictions' -Value 3   # block all downloads
+Set-RegDword -Path $HKLM_EdgePolicies -Name 'DeveloperToolsAvailability' -Value 2   # disable F12 DevTools
+
+# Block the local/internal URL schemes a user could type or navigate to reach
+# the disk (file:///C:/) or the browser's own settings (edge://settings, flags,
+# downloads). The kiosk's own offline fallback page is a file:// URL, so it must
+# be allow-listed back in (allowlist entries override the blocklist). https web
+# navigation is deliberately left open so the clinical site and its auth/API
+# hosts keep working -- tighten to a strict origin allowlist only after you have
+# enumerated every host colpo.cellari.io depends on (see security notes).
+$edgeBlocklist = @('file://*', 'edge://settings/*', 'edge://flags/*', 'edge://downloads/*', 'edge://net-export/*', 'edge://extensions/*', 'edge://system/*')
+$edgeAllowlist = @('file:///C:/Kiosk/offline.html', 'https://colpo.cellari.io/*', 'http://127.0.0.1:3790/*')
+$blockKey = Join-Path $HKLM_EdgePolicies 'URLBlocklist'
+$allowKey = Join-Path $HKLM_EdgePolicies 'URLAllowlist'
+if (Test-Path $blockKey) { Remove-Item $blockKey -Recurse -Force -ErrorAction SilentlyContinue }
+if (Test-Path $allowKey) { Remove-Item $allowKey -Recurse -Force -ErrorAction SilentlyContinue }
+New-Item -Path $blockKey -Force | Out-Null
+New-Item -Path $allowKey -Force | Out-Null
+for ($i = 0; $i -lt $edgeBlocklist.Count; $i++) {
+    New-ItemProperty -Path $blockKey -Name ($i + 1) -Value $edgeBlocklist[$i] -PropertyType String -Force | Out-Null
+}
+for ($i = 0; $i -lt $edgeAllowlist.Count; $i++) {
+    New-ItemProperty -Path $allowKey -Name ($i + 1) -Value $edgeAllowlist[$i] -PropertyType String -Force | Out-Null
+}
+
+# Wipe the clinical site's cached pages/cookies when the session ends, so PHI is
+# not left readable on disk between users (pairs with BitLocker for at-rest).
+Set-RegDword -Path $HKLM_EdgePolicies -Name 'ClearBrowsingDataOnExit' -Value 1
+Set-RegDword -Path $HKLM_EdgePolicies -Name 'ClearCachedImagesAndFilesOnExit' -Value 1
+
+# Disable Windows touch edge-swipes: right-edge opens Action Center (whose Wi-Fi
+# toggle would kill both the kiosk and the Tailscale admin path), left-edge opens
+# Task View. On a keyboard-less tablet these gestures are the likeliest walk-up
+# escape, and Assigned Access does NOT suppress them.
+Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EdgeUI' -Name 'AllowEdgeSwipe' -Value 0
+Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer' -Name 'DisableNotificationCenter' -Value 1
+
 # Apply by closing Edge if open
 Get-Process -Name msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Write-Host "Edge policies set. (Restart Edge for effect.)"
+Write-Host "Edge kiosk-escape hardening applied (file dialogs, downloads, printing, DevTools, URL block/allow-list, edge swipes)."
 
-# --- Power: Stay Awake (No Sleep, Display Off only) ---
+# --- Power: Stay Awake (No Sleep, Display Off only) + Fast Startup ---
 try {
     $displayMinutes = 15
-    Write-Host "Configuring power: never sleep (AC/DC), display off after $displayMinutes min, disable hibernate..."
+    Write-Host "Configuring power: never sleep (AC/DC), display off after $displayMinutes min, fast startup..."
     powercfg /change standby-timeout-ac 0 | Out-Null
     powercfg /change standby-timeout-dc 0 | Out-Null
     powercfg /change monitor-timeout-ac $displayMinutes | Out-Null
     powercfg /change monitor-timeout-dc $displayMinutes | Out-Null
-    powercfg -hibernate off | Out-Null
-    Write-Host "Power settings updated. The PC will not sleep; only the display will turn off."
+
+    # Fast Startup halves power-on boot time on the 2-core m3-7Y30, and staff
+    # power-cycle the tablets. A 'reduced' hiberfile (~40% of RAM, ~1.6 GB disk)
+    # supports ONLY fast startup - full hibernate stays unavailable, and the
+    # timeouts below keep the machine from ever hibernating on its own. If a
+    # tablet misbehaves, RESTART it (restart is always a clean cold boot);
+    # plain off/on resumes the saved kernel state.
+    powercfg /hibernate on | Out-Null
+    powercfg /hibernate /type reduced | Out-Null
+    powercfg /change hibernate-timeout-ac 0 | Out-Null
+    powercfg /change hibernate-timeout-dc 0 | Out-Null
+    Set-RegDword -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name 'HiberbootEnabled' -Value 1
+    Write-Host "Power settings updated. No sleep; display off after $displayMinutes min; fast startup enabled."
 } catch {
     Write-Warning "Failed to update power settings: $($_.Exception.Message)"
+}
+
+# --- Performance: reduce memory/CPU pressure on low-RAM kiosk tablets ---
+if ($OptimizePerformance) {
+    # Microsoft Defender: real-time protection stays on, but it must not compete
+    # with the kiosk for CPU/RAM. C:\Kiosk is excluded because duvc-api.exe is
+    # SHA256-verified at install time, and re-scanning the extracted duvc-cli.exe
+    # slows every service start. With wuauserv disabled, definitions go stale and
+    # Defender compensates with catch-up scans; those are disabled explicitly.
+    try {
+        Write-Host "`nTuning Microsoft Defender for kiosk use..."
+
+        # C:\Kiosk inherits the C:\ root ACL, which grants Authenticated Users
+        # Modify on new subfolders. Combined with the Defender exclusion below,
+        # that makes it a write-anything, never-scanned directory that also holds
+        # the SYSTEM service binary duvc-api.exe -- a ready-made persistence/AV
+        # -evasion spot. Create it now and strip inheritance so only SYSTEM and
+        # Administrators can write; the kiosk user gets read/execute only. The
+        # DuvcApi service runs as LocalSystem, so runtime extraction of the
+        # embedded duvc-cli.exe still works.
+        if (-not (Test-Path -LiteralPath 'C:\Kiosk')) { New-Item -ItemType Directory -Path 'C:\Kiosk' -Force | Out-Null }
+        icacls 'C:\Kiosk' /inheritance:r /grant '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+        Write-Host "C:\Kiosk ACL hardened (SYSTEM/Admins full; Users read+execute only)."
+
+        Add-MpPreference -ExclusionPath 'C:\Kiosk' -ErrorAction Stop
+        Set-MpPreference -ScanAvgCPULoadFactor 20 -ErrorAction SilentlyContinue
+        Set-MpPreference -ScanOnlyIfIdleEnabled $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableCatchupFullScan $true -DisableCatchupQuickScan $true -ErrorAction SilentlyContinue
+        Write-Host "Defender tuned: C:\Kiosk excluded; scans capped at 20% CPU and idle-only."
+    } catch {
+        Write-Warning "Failed to tune Defender: $($_.Exception.Message)"
+    }
+
+    # Edge memory policies: without these Edge keeps processes resident around the
+    # clock (startup boost/background mode) and renders the MSN feed on new tabs.
+    Write-Host "Applying Edge memory-saving policies..."
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'StartupBoostEnabled' -Value 0
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'BackgroundModeEnabled' -Value 0
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'SleepingTabsEnabled' -Value 1
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'NewTabPageContentEnabled' -Value 0
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'SearchSuggestEnabled' -Value 0
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'EdgeShoppingAssistantEnabled' -Value 0
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'PasswordManagerEnabled' -Value 0
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'AutofillCreditCardEnabled' -Value 0
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'AutofillAddressEnabled' -Value 0
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'PersonalizationReportingEnabled' -Value 0
+    Set-RegDword -Path $HKLM_EdgePolicies -Name 'DiagnosticData' -Value 0
+
+    # Services that only cost RAM/CPU on a single-app kiosk. Touch/tablet input
+    # services are deliberately NOT touched (on-screen keyboard must keep working).
+    $servicesToDisable = @(
+        'SysMain',           # Superfetch: prefetch cache churns RAM/disk, no benefit for one app
+        'WSearch',           # search indexing
+        'DiagTrack',         # telemetry
+        'dmwappushservice',  # telemetry push
+        'DPS',               # Diagnostic Policy Service: ~28 MB + idle CPU, only feeds troubleshooters
+        'WdiServiceHost',    # diagnostic host (depends on DPS)
+        'WdiSystemHost',     # diagnostic system host (depends on DPS)
+        'WerSvc',            # error reporting
+        'Spooler',           # printing
+        'Fax',
+        'MapsBroker',        # offline maps
+        'lfsvc',             # geolocation
+        'WalletService',
+        'PhoneSvc',
+        'RetailDemo',
+        'XblAuthManager', 'XblGameSave', 'XboxNetApiSvc', 'XboxGipSvc'
+    )
+    foreach ($svcName in $servicesToDisable) {
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc) {
+            try {
+                Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+                Set-Service -Name $svcName -StartupType Disabled -ErrorAction Stop
+                Write-Host "Disabled service: $svcName"
+            } catch {
+                Write-Warning "Could not disable service '$svcName': $($_.Exception.Message)"
+            }
+        }
+    }
+
+    # Telemetry scheduled tasks (CompatTelRunner is a classic CPU-spike source)
+    $tasksToDisable = @(
+        '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser',
+        '\Microsoft\Windows\Application Experience\ProgramDataUpdater',
+        '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator',
+        '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip'
+    )
+    foreach ($taskPath in $tasksToDisable) {
+        schtasks /Change /TN "$taskPath" /Disable 2>$null | Out-Null
+    }
+    Write-Host "Telemetry scheduled tasks disabled."
+
+    # Deny background apps for ALL users (HKLM policy also covers the kiosk user)
+    Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name 'LetAppsRunInBackground' -Value 2
+    Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' -Name 'AllowCortana' -Value 0
+    Write-Host "Background apps denied system-wide; Cortana disabled."
+
+    # Logon-phase cleanup: OneDrive delays the kiosk shell on a 2-core CPU and
+    # serves no purpose here. Uninstall it and drop the Default-profile Run
+    # entry so new (kiosk) accounts never re-install it per-user. Other Run
+    # entries are left alone on purpose (e.g. the duvc tray app must survive).
+    try {
+        Write-Host "Removing OneDrive..."
+        Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        $oneDriveSetup = @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($oneDriveSetup) {
+            Start-Process -FilePath $oneDriveSetup -ArgumentList '/uninstall' -Wait
+            Write-Host "OneDrive uninstalled."
+        } else {
+            Write-Host "OneDrive setup not found; skipping."
+        }
+    } catch {
+        Write-Warning "OneDrive removal failed: $($_.Exception.Message)"
+    }
+    try {
+        reg load HKU\KioskDefault "$env:SystemDrive\Users\Default\NTUSER.DAT" | Out-Null
+        Remove-ItemProperty -Path 'Registry::HKU\KioskDefault\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'OneDriveSetup' -ErrorAction SilentlyContinue
+        [gc]::Collect()   # release hive handles so unload succeeds
+        reg unload HKU\KioskDefault | Out-Null
+        Write-Host "Default-profile OneDrive autostart removed."
+    } catch {
+        Write-Warning "Could not clean Default-profile Run key: $($_.Exception.Message)"
+        try { reg unload HKU\KioskDefault 2>$null | Out-Null } catch {}
+    }
 }
 
 # =====================================================================
@@ -494,7 +705,9 @@ if ($InstallTailscale) {
 
         # Ensure service and login
         $svcName = 'Tailscale'
-        try { Set-Service -Name $svcName -StartupType Automatic } catch {}
+        # Delayed start keeps remote admin off the boot-critical path; the kiosk
+        # shell and camera API get the first CPU seconds on the 2-core m3.
+        try { sc.exe config $svcName start= delayed-auto | Out-Null } catch {}
         try { Start-Service -Name $svcName -ErrorAction SilentlyContinue } catch {}
 
         Write-Host "Launching Tailscale login flow... Complete the login in your browser."
@@ -506,6 +719,30 @@ if ($InstallTailscale) {
             try { New-ItemProperty -Path 'HKLM:\SOFTWARE\Tailscale IPN' -Name 'UnattendedMode' -Value 1 -PropertyType DWord -Force | Out-Null } catch {}
             try { Restart-Service -Name $svcName -Force -ErrorAction SilentlyContinue } catch {}
             Write-Host "Tailscale unattended mode enabled."
+        }
+
+        # Re-assert the RDP firewall rule now that the Tailscale adapter exists.
+        # The rule was first created in STEP 2, before Tailscale was installed, so
+        # on a first run its InterfaceAlias binding could not be set and the rule
+        # degraded to source-IP-only (RemoteAddress 100.64.0.0/10). Bind it to the
+        # Tailscale interface now so RDP is reachable ONLY over the tailnet NIC,
+        # not from any interface that happens to spoof a CGNAT source address.
+        if ($HardenDevice -and $EnableRdp) {
+            try {
+                $rdpRuleName = "RDP (Tailscale only)"
+                $tsIfAliases = (Get-NetAdapter -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like 'Tailscale*' -or $_.InterfaceDescription -like '*Tailscale*' } |
+                    Select-Object -ExpandProperty Name)
+                if ($tsIfAliases -and $tsIfAliases.Count -gt 0) {
+                    Get-NetFirewallRule -DisplayName $rdpRuleName -ErrorAction SilentlyContinue |
+                        Set-NetFirewallRule -InterfaceAlias $tsIfAliases -ErrorAction SilentlyContinue
+                    Write-Host "RDP rule bound to Tailscale interface: $($tsIfAliases -join ', ')."
+                } else {
+                    Write-Warning "Tailscale adapter not found; RDP rule remains source-IP-only (100.64.0.0/10). Re-run after Tailscale is fully up to tighten it."
+                }
+            } catch {
+                Write-Warning "Could not re-assert RDP interface binding: $($_.Exception.Message)"
+            }
         }
     } catch {
         Write-Warning "Failed to install/start Tailscale: $($_.Exception.Message)"
@@ -577,14 +814,92 @@ if ($InstallDuvc) {
     }
 }
 
+# --- Remove Microsoft Office (kiosk has no use for it) ---
+# The tablets ship with preinstalled Office (Click-to-Run), whose OfficeClickToRun
+# updater service sits resident and its Start-menu stubs invite escape. Removal is
+# layered and best-effort so an unattended run never hangs: (1) strip the Appx
+# Office/OneNote stubs, (2) attempt a silent Click-to-Run uninstall of ALL Office
+# products with a timeout, (3) guarantee the background service stops by disabling
+# ClickToRunSvc even if a full uninstall could not complete.
+if ($OptimizePerformance) {
+    Write-Host "`nRemoving Microsoft Office..."
+
+    # (1) Appx stubs (the Start-menu "Office"/"Get Office" hub, OneNote UWP, etc.)
+    $officeAppx = @('Microsoft.MicrosoftOfficeHub', 'Microsoft.Office.OneNote', 'Microsoft.Office.Desktop', 'Microsoft.OfficeLens')
+    foreach ($pkg in $officeAppx) {
+        try { Get-AppxPackage -AllUsers -Name $pkg -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue } catch {}
+        try { Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq $pkg } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null } catch {}
+    }
+
+    # (2) Silent Click-to-Run uninstall of all Office products, if C2R is present.
+    $c2rExe = Join-Path $env:CommonProgramFiles 'Microsoft Shared\ClickToRun\OfficeClickToRun.exe'
+    if (Test-Path $c2rExe) {
+        try {
+            Write-Host "Uninstalling Click-to-Run Office (this can take several minutes)..."
+            Start-ProcessWithTimeout -FilePath $c2rExe -ArgumentList 'scenario=install scenariosubtype=ARP sourcetype=None productstoremove=AllProducts DisplayLevel=False' -TimeoutSeconds 600 -ActionLabel 'Office uninstall'
+            Write-Host "Office Click-to-Run uninstall finished."
+        } catch {
+            Write-Warning "Office Click-to-Run uninstall did not complete: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Host "No Click-to-Run Office found; skipping C2R uninstall."
+    }
+
+    # (3) Guaranteed fallback: stop the resident updater service so it frees memory
+    # even if products remain. Harmless on a kiosk that never launches Office.
+    foreach ($officeSvc in 'ClickToRunSvc', 'ose64', 'ose') {
+        $svc = Get-Service -Name $officeSvc -ErrorAction SilentlyContinue
+        if ($svc) {
+            try {
+                Stop-Service -Name $officeSvc -Force -ErrorAction SilentlyContinue
+                Set-Service -Name $officeSvc -StartupType Disabled -ErrorAction Stop
+                Write-Host "Disabled Office service: $officeSvc"
+            } catch {
+                Write-Warning "Could not disable Office service '$officeSvc': $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
 # --- Optional: Windows 10 Debloater (Full repo, at end) ---
+# SUPPLY-CHAIN NOTE: this fetches a third-party repo and runs it elevated with
+# -ExecutionPolicy Bypass. Pulling the MUTABLE master branch means whatever is on
+# GitHub at run time executes as SYSTEM on a clinical device -- a repo compromise
+# or account takeover would run arbitrary code on every kiosk. Two hardening
+# levers below:
+#   1. $DebloaterCommit pins an IMMUTABLE commit archive instead of master.
+#   2. $ExpectedDebloaterZipSha256, if set, is verified before extraction.
+# The Performance section above already disables SysMain/telemetry/Xbox/OneDrive
+# etc., so this Sycnex debloater is now largely redundant; prefer vendoring a
+# reviewed copy next to duvc-api.exe (hash-verified like the API) over this path.
 if ($RunDebloater) {
+    # Set to a full 40-char commit SHA to pin (recommended); '' uses master.
+    $DebloaterCommit = ''
+    # Set to the known SHA256 of the downloaded ZIP to enforce integrity; '' warns.
+    $ExpectedDebloaterZipSha256 = ''
     try {
-        $zipUrl   = 'https://github.com/Sycnex/Windows10Debloater/archive/refs/heads/master.zip'
+        if ($DebloaterCommit) {
+            $zipUrl  = "https://github.com/Sycnex/Windows10Debloater/archive/$DebloaterCommit.zip"
+            $extract = Join-Path $env:TEMP "Windows10Debloater-$DebloaterCommit"
+        } else {
+            Write-Warning "Debloater is pinned to the MUTABLE master branch. Set `$DebloaterCommit to a commit SHA for a reproducible, tamper-evident download."
+            $zipUrl  = 'https://github.com/Sycnex/Windows10Debloater/archive/refs/heads/master.zip'
+            $extract = Join-Path $env:TEMP 'Windows10Debloater-master'
+        }
         $zipPath  = Join-Path $env:TEMP 'Windows10Debloater.zip'
-        $extract  = Join-Path $env:TEMP 'Windows10Debloater-master'
         Write-Host "Downloading Windows10Debloater repository (ZIP)..."
         Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
+
+        $actualZipSha = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToUpperInvariant()
+        if ($ExpectedDebloaterZipSha256) {
+            if ($actualZipSha -ne $ExpectedDebloaterZipSha256.ToUpperInvariant()) {
+                throw "Debloater ZIP SHA256 mismatch (expected $ExpectedDebloaterZipSha256, got $actualZipSha). Refusing to run."
+            }
+            Write-Host "Debloater ZIP integrity verified."
+        } else {
+            Write-Warning "Debloater ZIP not integrity-checked (SHA256 $actualZipSha). Set `$ExpectedDebloaterZipSha256 to enforce it."
+        }
+
         if (Test-Path $extract) { Remove-Item -Recurse -Force -LiteralPath $extract }
         Write-Host "Extracting..."
         Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -610,4 +925,12 @@ try {
     Write-Warning "Could not revert ExecutionPolicy: $($_.Exception.Message)"
 }
 Write-Host "`nDone. '$Ssid' will auto-connect when detected. Edge Visual Search & sidebar/Copilot/Discover disabled. Sleep disabled (display off after 15 min). RDP enabled if you chose it. ExecutionPolicy reverted."
+Write-Host ""
+Write-Host "  !!  PHYSICAL SECURITY IS NOT COMPLETE FROM THIS SCRIPT ALONE  !!" -ForegroundColor Yellow
+Write-Host "  This script cannot lock firmware or encrypt the disk. Before the tablet" -ForegroundColor Yellow
+Write-Host "  goes into production you MUST also, by hand:" -ForegroundColor Yellow
+Write-Host "    1. Enable BitLocker (TPM protector) and escrow the recovery key off-device." -ForegroundColor Yellow
+Write-Host "    2. Set a Surface UEFI admin password; disable USB/alternate boot; keep Secure Boot on." -ForegroundColor Yellow
+Write-Host "    3. Confirm the Assigned Access account is a Standard user (never Administrator)." -ForegroundColor Yellow
+Write-Host "    4. In the Tailscale admin console: tag kiosk nodes + ACLs so a stolen node cannot reach other kiosks; keep key expiry on." -ForegroundColor Yellow
 exit 0
