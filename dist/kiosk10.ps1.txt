@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Configure Windows 10 kiosk for auto-connect to an open SSID (default: Gaestenet),
+  Configure Windows 10/11 kiosk for auto-connect to an open SSID (default: Gaestenet),
   disable Microsoft Edge Visual Search & sidebar/Copilot/Discover, optionally disable
   Windows automatic updates, install Tailscale + the Camera Control API, and revert
   execution policy.
@@ -143,6 +143,12 @@ function Start-ProcessWithTimeout {
 # --- MAIN ---
 Assert-Admin
 
+# Windows 11 = build 22000+. Used to apply Win11-only policies (Widgets/Copilot/
+# Chat) and to skip the Windows-10-only Sycnex debloater.
+$osBuild = [System.Environment]::OSVersion.Version.Build
+$IsWindows11 = $osBuild -ge 22000
+if ($IsWindows11) { Write-Host "Windows 11 detected (build $osBuild); Win11-specific kiosk hardening will be applied." }
+
 # =====================================================================
 # STEP 1: Collect all settings up front. No long-running work happens
 # here, so the operator can answer everything and then walk away while
@@ -192,9 +198,15 @@ $EnableTsUnatt = if ([string]::IsNullOrWhiteSpace($unattInput)) { $true } else {
 $duvcInput = Read-Host "Install Camera Control API service (duvc-api) now? (Y/n)"
 $InstallDuvc = if ([string]::IsNullOrWhiteSpace($duvcInput)) { $true } else { $duvcInput.ToLower() -ne "n" }
 
-# Windows 10 Debloater (long-running)
-$debloatInput = Read-Host "Download full Windows10Debloater repo and run SysPrep debloater now? (Y/n)"
-$RunDebloater = if ([string]::IsNullOrWhiteSpace($debloatInput)) { $true } else { $debloatInput.ToLower() -ne "n" }
+# Windows 10 Debloater (long-running). Windows-10-only: on Win11 the Sycnex
+# script is untested and redundant, so don't even offer it.
+if ($IsWindows11) {
+    Write-Host "Windows10Debloater: not offered on Windows 11 (Win10-only tool; perf/appx sections cover it)."
+    $RunDebloater = $false
+} else {
+    $debloatInput = Read-Host "Download full Windows10Debloater repo and run SysPrep debloater now? (Y/n)"
+    $RunDebloater = if ([string]::IsNullOrWhiteSpace($debloatInput)) { $true } else { $debloatInput.ToLower() -ne "n" }
+}
 
 Write-Host "`n=== All settings collected. Applying configuration... ===`n"
 
@@ -475,6 +487,22 @@ Set-RegDword -Path $HKLM_EdgePolicies -Name 'ClearCachedImagesAndFilesOnExit' -V
 # escape, and Assigned Access does NOT suppress them.
 Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EdgeUI' -Name 'AllowEdgeSwipe' -Value 0
 Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer' -Name 'DisableNotificationCenter' -Value 1
+
+# Windows 11 ships three walk-up surfaces Windows 10 never had. All three are
+# web-connected UIs reachable from the kiosk shell, so they are escape vectors
+# as well as RAM cost; AllowEdgeSwipe above blocks the gestures, these policies
+# stop the hosts themselves.
+if ($IsWindows11) {
+    Write-Host "Applying Windows 11 policies (Widgets, Copilot, taskbar Chat)..."
+    # Widgets board (left-edge swipe / Win+W); also stops the Dsh/WebExperience host
+    Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Value 0
+    # Windows Copilot (taskbar button / Win+C). Policy is user-scope by design,
+    # so set HKCU for the operator now and HKLM defensively for other accounts.
+    Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' -Name 'TurnOffWindowsCopilot' -Value 1
+    Set-RegDword -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' -Name 'TurnOffWindowsCopilot' -Value 1
+    # Taskbar Chat / consumer Teams icon (3 = hidden, policy-enforced)
+    Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat' -Name 'ChatIcon' -Value 3
+}
 
 # Apply by closing Edge if open
 Get-Process -Name msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -831,6 +859,27 @@ if ($OptimizePerformance) {
         try { Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq $pkg } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null } catch {}
     }
 
+    # Windows 11 consumer apps: the Widgets host, consumer Teams chat, Copilot,
+    # Dev Home and new Outlook all keep background processes/updaters alive on a
+    # low-RAM tablet. Policies above already hide them; removing the packages
+    # frees the memory too. Same best-effort pattern as the Office stubs.
+    if ($IsWindows11) {
+        Write-Host "Removing Windows 11 consumer apps (Widgets host, Teams chat, Copilot, Dev Home, new Outlook)..."
+        $win11Appx = @(
+            'MicrosoftWindows.Client.WebExperience',  # Widgets host
+            'MicrosoftTeams',                          # consumer Teams / taskbar Chat
+            'Microsoft.Copilot',
+            'Microsoft.Windows.Ai.Copilot.Provider',
+            'Microsoft.Windows.DevHome',
+            'Microsoft.OutlookForWindows',
+            'Microsoft.549981C3F5F10'                  # Cortana app
+        )
+        foreach ($pkg in $win11Appx) {
+            try { Get-AppxPackage -AllUsers -Name $pkg -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue } catch {}
+            try { Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq $pkg } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null } catch {}
+        }
+    }
+
     # (2) Silent Click-to-Run uninstall of all Office products, if C2R is present.
     $c2rExe = Join-Path $env:CommonProgramFiles 'Microsoft Shared\ClickToRun\OfficeClickToRun.exe'
     if (Test-Path $c2rExe) {
@@ -872,6 +921,10 @@ if ($OptimizePerformance) {
 # The Performance section above already disables SysMain/telemetry/Xbox/OneDrive
 # etc., so this Sycnex debloater is now largely redundant; prefer vendoring a
 # reviewed copy next to duvc-api.exe (hash-verified like the API) over this path.
+if ($RunDebloater -and $IsWindows11) {
+    Write-Warning "Skipping Windows10Debloater: it targets Windows 10 and is untested on Windows 11. The Performance and Win11 sections above already cover its useful parts."
+    $RunDebloater = $false
+}
 if ($RunDebloater) {
     # Set to a full 40-char commit SHA to pin (recommended); '' uses master.
     $DebloaterCommit = ''
