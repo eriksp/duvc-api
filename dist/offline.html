@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cellari Clinical System</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #ffffff; }
+    body {
+      display: grid; place-items: center;
+      font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, "Noto Sans", "Helvetica Neue", sans-serif;
+      color: #0f172a;
+    }
+    .wrap { width: 100%; max-width: 440px; padding: 24px; text-align: center; animation: fadeIn .25s ease-out both; }
+    .logo { display: grid; place-items: center; margin: 10vh 0 24px; }
+    .logo svg { width: 192px; height: 192px; display: block; }
+    .status { font-size: 14px; color: #475569; }
+    .dot {
+      width: 10px; height: 10px; border-radius: 999px; display:inline-block;
+      background: #0ea5e9; box-shadow: 0 0 0 0 rgba(14,165,233,.7);
+      animation: pulse 1.5s infinite; vertical-align: -1px; margin-right: 8px;
+    }
+    .help { display:none; margin-top: 14px; font-size: 13px; color: #1f2937; }
+    .code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      background: #f1f5f9; border: 1px solid #e2e8f0; padding: 2px 6px; border-radius: 6px;
+    }
+    a { color: #0ea5e9; text-decoration: none; } a:hover { text-decoration: underline; }
+    @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(14,165,233,.6)} 70%{box-shadow:0 0 0 10px rgba(14,165,233,0)} 100%{box-shadow:0 0 0 0 rgba(14,165,233,0)} }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="logo" aria-label="Cellari Colpo logo">
+      <!-- Inline SVG logo (from your previous message) -->
+      <svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg"
+           viewBox="0 0 198.43 198.43" height="192" width="192">
+        <defs>
+          <style>
+            .cls-1,.cls-2,.cls-3{fill:#23293d;isolation:isolate;}
+            .cls-1{opacity:0.5;}
+            .cls-2{opacity:0.75;}
+            .cls-4{fill:url(#linear-gradient);}
+          </style>
+          <linearGradient id="linear-gradient" x1="96.67" y1="186.06" x2="83.22" y2="6.6"
+            gradientTransform="matrix(1,0,0,-1,0,194.38)" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#009cfc"/><stop offset="1" stop-color="#363795"/>
+          </linearGradient>
+        </defs>
+        <path class="cls-1" d="M115.17,90.91l30.2,17c3.7,2.1,3.3,5.8-.9,8.2l-34.2,20.3c-4.2,2.5-10.5,2.8-14.2.7l-30.2-17c-3.7-2.1-3.3-5.8.9-8.2L101,91.61C105.07,89.21,111.47,88.81,115.17,90.91Z"/>
+        <path class="cls-2" d="M116.87,74.41l30.2,17c3.7,2.1,3.3,5.8-.9,8.2L112,119.91c-4.2,2.5-10.5,2.8-14.2.7l-30.2-17c-3.7-2.1-3.3-5.8.9-8.2l34.2-20.3C106.87,72.71,113.27,72.31,116.87,74.41Z"/>
+        <path class="cls-3" d="M118.67,57.91l30.2,17c3.7,2.1,3.3,5.8-.9,8.2l-34.2,20.3c-4.2,2.5-10.5,2.8-14.2.7l-30.2-17c-3.7-2.1-3.3-5.8.9-8.2l34.2-20.3C108.57,56.21,115,55.81,118.67,57.91Z"/>
+        <path class="cls-4" d="M143.77,140.81a61.2,61.2,0,1,1,0-86.6l17.7-17.7a86.3,86.3,0,1,0,0,122Z"/>
+      </svg>
+    </div>
+
+    <div class="status"><span class="dot" aria-hidden="true"></span>
+      <span id="msg">Trying to connect to the internet…</span>
+    </div>
+    <div id="help" class="help">
+      No internet connection detected. Please contact your system administrator and reference error code
+      <span class="code">ERR-NET-60S</span> — or email contact@cellari.io.
+    </div>
+  </div>
+
+<script>
+  // --- Config ---
+  const TARGET = "https://colpo.cellari.io";
+  const LOGO_PROBE = `${TARGET}/assets/images/logo.svg`; // internal (might be SW-cached)
+  const EXT_IMG_PROBE = "https://www.microsoft.com/favicon.ico"; // external image
+  const EXT_FETCH_PROBE = "http://www.msftconnecttest.com/connecttest.txt"; // external fetch (HTTP on purpose)
+  const INTERVAL_MS = 2000;
+  const TIMEOUT_MS  = 5000;
+  const CYCLES_REQUIRED = 2; // require two consecutive cycles where ALL probes pass
+
+  // --- UI status rotation & 120s help ---
+  const msgEl = document.getElementById("msg");
+  const helpEl = document.getElementById("help");
+  const msgs = ["Checking network…", "Resolving DNS…", "Verifying internet…", "Contacting colpo.cellari.io…"];
+  let step = 0;
+  setInterval(() => { step = (step + 1) % msgs.length; msgEl.textContent = msgs[step]; }, 1600);
+  setTimeout(() => { helpEl.style.display = "block"; }, 120000);
+
+  // --- Helpers ---
+  function probeImage(url) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const t = setTimeout(() => { img.src = ""; resolve(false); }, TIMEOUT_MS);
+      img.onload = () => { clearTimeout(t); resolve(true); };
+      img.onerror = () => { clearTimeout(t); resolve(false); };
+      img.referrerPolicy = "no-referrer";
+      img.src = `${url + (url.includes("?") ? "&" : "?")}t=${Date.now()}`;
+    });
+  }
+
+  function timeout(ms) {
+    return new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms));
+  }
+
+  async function probeFetch(url) {
+    try {
+      await Promise.race([
+        fetch(`${url + (url.includes("?") ? "&" : "?")}t=${Date.now()}`, { mode: "no-cors", cache: "no-store" }),
+        timeout(TIMEOUT_MS)
+      ]);
+      return true; // if it didn't throw or timeout, network path exists
+    } catch {
+      return false;
+    }
+  }
+
+  async function probeOnce() {
+    // Run all three in parallel:
+    const [logoOK, extImgOK, extFetchOK] = await Promise.all([
+      probeImage(LOGO_PROBE),
+      probeImage(EXT_IMG_PROBE),
+      probeFetch(EXT_FETCH_PROBE)
+    ]);
+    // Require internal logo (server/DNS/HTTPS) AND both external checks (avoid SW cache & captive portals)
+    return logoOK && extImgOK && extFetchOK;
+  }
+
+  (async function waitAndGo(){
+    let consecutiveOK = 0;
+    while (true) {
+      const ok = await probeOnce();
+      if (ok) {
+        consecutiveOK++;
+        if (consecutiveOK >= CYCLES_REQUIRED) {
+          window.location.replace(TARGET);
+          return;
+        }
+      } else {
+        consecutiveOK = 0;
+      }
+      await new Promise(r => setTimeout(r, INTERVAL_MS));
+    }
+  })();
+</script>
+</body>
+</html>
