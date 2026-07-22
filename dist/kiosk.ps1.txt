@@ -461,8 +461,18 @@ Set-RegDword -Path $HKLM_EdgePolicies -Name 'DeveloperToolsAvailability' -Value 
 # navigation is deliberately left open so the clinical site and its auth/API
 # hosts keep working -- tighten to a strict origin allowlist only after you have
 # enumerated every host colpo.cellari.io depends on (see security notes).
+#
+# file:// allowlist syntax is a trap: the filter grammar is
+# [scheme://][.]host[:port][/path] and HOST IS REQUIRED. A real file URL has an
+# EMPTY host (file:///C:/... -- that is what the third slash means), so the
+# obvious entry 'file:///C:/Kiosk/offline.html' is structurally invalid, gets
+# silently dropped, and 'file://*' blocks the kiosk's own start page ("Your
+# organization doesn't allow you to view this site"). The valid spelling uses
+# '*' as the host with the path after it. Path matching is case-SENSITIVE, so
+# a lowercase variant is included to cover however Assigned Access spells the
+# start URL. Do not "simplify" these back to the file:/// form.
 $edgeBlocklist = @('file://*', 'edge://settings/*', 'edge://flags/*', 'edge://downloads/*', 'edge://net-export/*', 'edge://extensions/*', 'edge://system/*')
-$edgeAllowlist = @('file:///C:/Kiosk/offline.html', 'https://colpo.cellari.io/*', 'http://127.0.0.1:3790/*')
+$edgeAllowlist = @('file://*/C:/Kiosk/offline.html', 'file://*/c:/kiosk/offline.html', 'https://colpo.cellari.io/*', 'http://127.0.0.1:3790/*')
 $blockKey = Join-Path $HKLM_EdgePolicies 'URLBlocklist'
 $allowKey = Join-Path $HKLM_EdgePolicies 'URLAllowlist'
 if (Test-Path $blockKey) { Remove-Item $blockKey -Recurse -Force -ErrorAction SilentlyContinue }
