@@ -780,8 +780,8 @@ if ($InstallTailscale) {
 # --- Camera Control API (duvc-api) ---
 if ($InstallDuvc) {
     try {
-        $duvcExeUrl = 'https://github.com/eriksp/duvc-api/releases/download/v1.7.1/duvc-api.exe'
-        $duvcShaUrl = 'https://github.com/eriksp/duvc-api/releases/download/v1.7.1/duvc-api.exe.sha256'
+        $duvcExeUrl = 'https://github.com/eriksp/duvc-api/releases/download/v1.7.2/duvc-api.exe'
+        $duvcShaUrl = 'https://github.com/eriksp/duvc-api/releases/download/v1.7.2/duvc-api.exe.sha256'
         # Keep the API alongside the other kiosk files in C:\Kiosk. duvc-cli.exe
         # is embedded in duvc-api.exe and the API extracts it next to itself.
         $duvcDir = 'C:\Kiosk'

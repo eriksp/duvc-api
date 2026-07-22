@@ -23,11 +23,11 @@ bld/
 [Ll]og/
 [Ll]ogs/
 dist/*
-# kiosk10.ps1.txt is the single source of truth for the kiosk setup script
+# kiosk.ps1.txt is the single source of truth for the kiosk setup script
 # (.txt so tablets can download it via browser; .ps1 downloads get blocked)
-!dist/kiosk10.ps1.txt
+!dist/kiosk.ps1.txt
 # offline.html is the master copy of the kiosk fallback page (deployed to
-# colpo.cellari.io/assets/offline.html, which kiosk10.ps1.txt downloads)
+# colpo.cellari.io/assets/offline.html, which kiosk.ps1.txt downloads)
 !dist/offline.html
 
 # .NET Core
