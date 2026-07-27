@@ -2048,17 +2048,14 @@ namespace DuvcApi
             _taskbarListener = new TaskbarCreatedListener();
             _taskbarListener.TaskbarCreated += ReassertNotifyIcon;
 
-            // Belt-and-suspenders: if our first Visible=true above was rejected
-            // and no TaskbarCreated fires (e.g. session re-attach), re-toggle
-            // once the message pump is up.
-            var bootRetry = new System.Windows.Forms.Timer { Interval = 200 };
-            bootRetry.Tick += (s, e) =>
+            // Belt-and-suspenders: if the first Visible above was rejected and no
+            // TaskbarCreated fires (e.g. session re-attach), re-assert on a short
+            // bounded schedule. Skipped entirely in kiosk mode, where there is no
+            // icon to register.
+            if (_ui.ShowTrayIcon)
             {
-                bootRetry.Stop();
-                bootRetry.Dispose();
-                ReassertNotifyIcon();
-            };
-            bootRetry.Start();
+                StartTrayRegistrationRetries();
+            }
 
             var menu = new ContextMenuStrip();
             menu.ShowImageMargin = false;
@@ -2372,6 +2369,34 @@ namespace DuvcApi
             {
                 Logger.Error("Reassert tray icon failed: " + ex.Message);
             }
+        }
+
+        // Gaps between re-assert attempts, so attempts land at roughly 200 ms,
+        // 5 s and 20 s after construction. Shell_NotifyIcon gives no success
+        // signal — WinForms swallows a failed NIM_ADD — so we cannot query
+        // whether registration took and must simply retry. Three attempts keeps
+        // flicker negligible while covering a cold boot where Explorer is not
+        // ready at the first attempt.
+        private static readonly int[] TrayRetryGapsMs = { 200, 4800, 15000 };
+
+        private void StartTrayRegistrationRetries()
+        {
+            var index = 0;
+            var retry = new System.Windows.Forms.Timer();
+            retry.Interval = TrayRetryGapsMs[0];
+            retry.Tick += (s, e) =>
+            {
+                ReassertNotifyIcon();
+                index++;
+                if (index >= TrayRetryGapsMs.Length)
+                {
+                    retry.Stop();
+                    retry.Dispose();
+                    return;
+                }
+                retry.Interval = TrayRetryGapsMs[index];
+            };
+            retry.Start();
         }
 
         // Opportunistic: if the service is installed but stopped, try to start it.
