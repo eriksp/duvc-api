@@ -1623,7 +1623,7 @@ namespace DuvcApi
             try
             {
                 // Drop any handle from a previous failed Acquire so this call
-                // can claim ownership cleanly (e.g. after KillOtherInstances).
+                // can claim ownership cleanly on a retry.
                 if (_mutex != null)
                 {
                     try { _mutex.Close(); } catch { }
@@ -1958,20 +1958,28 @@ namespace DuvcApi
         public bool ShowBalloon { get; private set; }
         public bool ShowStartupErrorDialog { get; private set; }
 
-        private TrayUiPolicy(bool showTrayIcon, bool showBalloon, bool showStartupErrorDialog)
+        // Whether the Control Panel window may open at all. Until now it was
+        // unreachable on a kiosk only as a side effect of the tray icon being
+        // hidden; the show-panel request file is a second route in, so the rule
+        // is stated explicitly and enforced in ShowControlPanel itself.
+        public bool AllowControlPanel { get; private set; }
+
+        private TrayUiPolicy(bool showTrayIcon, bool showBalloon, bool showStartupErrorDialog,
+            bool allowControlPanel)
         {
             ShowTrayIcon = showTrayIcon;
             ShowBalloon = showBalloon;
             ShowStartupErrorDialog = showStartupErrorDialog;
+            AllowControlPanel = allowControlPanel;
         }
 
         public static TrayUiPolicy FromEnvironment()
         {
             if (Program.IsKioskMode)
             {
-                return new TrayUiPolicy(false, false, false);
+                return new TrayUiPolicy(false, false, false, false);
             }
-            return new TrayUiPolicy(true, true, true);
+            return new TrayUiPolicy(true, true, true, true);
         }
     }
 
@@ -2109,8 +2117,16 @@ namespace DuvcApi
             };
             _notifyIcon.DoubleClick += (sender, args) => ShowControlPanel();
 
+            // Drop any request left behind by a previous run, so a stale file
+            // cannot pop the Control Panel open on the next start.
+            TryDeleteShowPanelRequest();
+
             _timer = new System.Windows.Forms.Timer { Interval = 2000 };
-            _timer.Tick += (sender, args) => UpdateStatus();
+            _timer.Tick += (sender, args) =>
+            {
+                UpdateStatus();
+                PollShowPanelRequest();
+            };
             _timer.Start();
             UpdateStatus();
 
@@ -2265,49 +2281,36 @@ namespace DuvcApi
             }
             if (!InstanceGuard.IsOwner)
             {
+                // An instance is already running and owns the API. Launching the
+                // exe again is how a user asks to see the Control Panel, so hand
+                // the request to the running instance and exit instead of
+                // offering to kill it -- the running instance is usually the one
+                // the watchdog started, and killing it takes the API down.
                 if (!silent)
                 {
-                    var result = MessageBox.Show(
-                        "Another instance is already running. Stop it and start a new one?",
-                        Program.AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                    if (result == DialogResult.Yes)
-                    {
-                        KillOtherInstances();
-                        app = new TrayApp(startServer);
-                        if (app.StartupAborted)
-                        {
-                            return;
-                        }
-                        if (InstanceGuard.IsOwner)
-                        {
-                            Application.Run(app);
-                        }
-                    }
+                    RequestShowPanelFromRunningInstance();
                 }
                 return;
             }
             Application.Run(app);
         }
 
-        private static void KillOtherInstances()
+        // The running instance polls for this file every 2 s and opens its Control
+        // Panel. Best-effort: this process is about to exit either way, and it has
+        // no window of its own to report a failure in, so log and move on.
+        private static void RequestShowPanelFromRunningInstance()
         {
-            var currentPid = Process.GetCurrentProcess().Id;
-            var myName = Process.GetCurrentProcess().ProcessName;
-            foreach (var proc in Process.GetProcessesByName(myName))
+            try
             {
-                if (proc.Id != currentPid)
-                {
-                    try
-                    {
-                        proc.Kill();
-                        proc.WaitForExit(5000);
-                    }
-                    catch { }
-                }
-                proc.Dispose();
+                Directory.CreateDirectory(Paths.StateDir);
+                File.WriteAllText(Paths.ShowPanelRequestFile,
+                    DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
+                Logger.Info("Another instance owns the API; asked it to show the Control Panel.");
             }
-            // Wait for mutex to be released
-            Thread.Sleep(1000);
+            catch (Exception ex)
+            {
+                Logger.Error("Could not request the Control Panel from the running instance: " + ex.Message);
+            }
         }
 
         private void UpdateStatus()
@@ -2637,8 +2640,49 @@ namespace DuvcApi
             }
         }
 
+        // Signalled by a second instance that could not take the mutex. Delete
+        // first, then act: if opening the panel throws, we must not retry every
+        // tick forever.
+        private void PollShowPanelRequest()
+        {
+            try
+            {
+                if (!File.Exists(Paths.ShowPanelRequestFile))
+                {
+                    return;
+                }
+                TryDeleteShowPanelRequest();
+                Logger.Info("Show-panel request received from a second instance.");
+                ShowControlPanel();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Show-panel request handling failed: " + ex.Message);
+            }
+        }
+
+        private static void TryDeleteShowPanelRequest()
+        {
+            try
+            {
+                if (File.Exists(Paths.ShowPanelRequestFile))
+                {
+                    File.Delete(Paths.ShowPanelRequestFile);
+                }
+            }
+            catch { }
+        }
+
         private void ShowControlPanel()
         {
+            // Kiosk installs show no desktop chrome. Enforced here rather than at
+            // each call site so the tray menu, the double-click handler and the
+            // show-panel request file are all covered by one rule.
+            if (!_ui.AllowControlPanel)
+            {
+                return;
+            }
+
             try
             {
                 if (_controlPanel == null || _controlPanel.IsDisposed)
@@ -3269,6 +3313,11 @@ namespace DuvcApi
         public static string LogFile { get { return Path.Combine(StateDir, "duvc-api.log"); } }
 
         public static string RequestFile { get { return Path.Combine(StateDir, "update.request"); } }
+
+        // Written by a second instance that found one already running, polled and
+        // deleted by the running instance. Same convention as RequestFile: the
+        // file's existence is the whole signal, contents are ignored.
+        public static string ShowPanelRequestFile { get { return Path.Combine(StateDir, "showpanel.request"); } }
 
         public static string CurrentExe { get { return Process.GetCurrentProcess().MainModule.FileName; } }
 
