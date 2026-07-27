@@ -19,10 +19,11 @@ Two distinct problems, both in `TrayApp`:
    fails to bind — a modal error dialog with Open/Exit buttons. On a locked-down kiosk
    nobody can dismiss that dialog.
 
-There is a third, quieter problem that becomes important once (1) is fixed: with the panel
-no longer auto-opening, **the tray icon becomes the only evidence the API is alive**. Its
-registration has a boot race (see "Tray reliability" below), so its reliability stops
-being cosmetic.
+There is a third consequence that becomes important once (1) is fixed: with the panel no
+longer auto-opening, **the tray icon becomes the only evidence the API is alive**. Icon
+registration already has retry machinery from v1.7.0; what it lacks is coverage for a
+repeated early failure, and — once kiosk mode exists — a guard so that machinery does not
+un-hide a deliberately suppressed icon. See "Tray reliability" below.
 
 ## Architecture context
 
@@ -93,21 +94,36 @@ mirrors what the existing "Exit" button already does and avoids a silent permane
 failure where the process lives on serving nothing. The accepted cost: a *persistent*
 failure becomes a ~10s relaunch loop, which is visible in the log.
 
-### 4. Tray reliability (non-kiosk only)
+### 4. Tray reliability
 
-Two changes, both scoped to the boot race:
+**What already exists (v1.7.0).** The constructor already installs a
+`TaskbarCreatedListener` that calls `ReassertNotifyIcon()` on every shell
+`TaskbarCreated` broadcast, plus a one-shot 200 ms `bootRetry` timer that re-asserts once
+the message pump is up. Explorer restarts and the common boot race are therefore already
+covered. An earlier draft of this spec claimed the `TaskbarCreated` subscription happened
+too late to matter; that is wrong — the window between constructing the `NotifyIcon` and
+subscribing is microseconds, and a listener created later still receives broadcasts from
+an Explorer that starts afterwards.
 
-- **Subscribe to `TaskbarCreated` before constructing the `NotifyIcon`.** Today the
-  subscription happens after construction, so a broadcast arriving in between is missed
-  and no icon ever appears.
-- **Two bounded re-asserts**, at roughly 5s and 20s after start, reusing the existing
-  `ReassertNotifyIcon` visible-toggle. These are skipped entirely in kiosk mode.
+**The correct change is twofold:**
+
+- **Kiosk safety (required, not optional).** `ReassertNotifyIcon()` currently sets
+  `Visible = true` unconditionally. Left alone, the 200 ms boot retry and every
+  subsequent Explorer restart would resurrect an icon that kiosk mode just suppressed.
+  `ReassertNotifyIcon` must return early when `ShowTrayIcon` is false, and the boot-retry
+  timer must not be started in kiosk mode. Without this, kiosk suppression silently does
+  not work.
+
+- **Extend the one-shot retry into a small bounded schedule (non-kiosk only).** The
+  existing retry fires once at 200 ms. On a cold boot the service can launch the app
+  before Explorer is ready, so that single attempt can fail with nothing after it except
+  a `TaskbarCreated` that may already have passed. Replace the one-shot with re-asserts
+  at 200 ms, 5 s, and 20 s, then stop.
 
 `NotifyIcon.Visible` reports no success signal — WinForms swallows a failed
 `Shell_NotifyIcon` — so there is no way to query whether registration took. Blind bounded
-re-assert is the pragmatic option; the count is held to two to limit visible flicker. The
-existing `TaskbarCreated` handler continues to cover explorer restarts, which is a
-different failure and already works.
+re-assert is the pragmatic option; the schedule is held to three attempts to limit
+visible flicker. This is a heuristic that widens coverage, not a guarantee.
 
 ### 5. Out of scope
 
@@ -133,6 +149,6 @@ has no test project, so verification is a manual matrix:
 ## Files affected
 
 - `src/DuvcApi/Program.cs` — kiosk accessor, `TrayUiPolicy`, `TrayApp` constructor changes,
-  `TaskbarCreated` subscription order, bounded re-asserts.
+  `ReassertNotifyIcon` kiosk guard, bounded re-assert schedule.
 - `dist/kiosk.ps1.txt` — set `DUVC_API_KIOSK=1` at Machine scope during duvc install.
 - `README.md` — document `DUVC_API_KIOSK` alongside the existing environment variables.
