@@ -336,6 +336,7 @@ All settings are optional and read from environment variables:
 - `DUVC_API_CAMERA_NAME` (default: `USB Camera`)
 - `DUVC_API_ALLOWED_ORIGINS` (comma-separated list; default allows all)
 - `DUVC_CLI_PATH` (override embedded `duvc-cli.exe` path)
+- `DUVC_API_KIOSK` (`1`/`true`/`yes` enables kiosk mode: no tray icon, no balloon, no dialogs)
 
 ## Camera Property Optimization
 

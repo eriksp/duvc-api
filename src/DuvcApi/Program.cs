@@ -113,6 +113,30 @@ namespace DuvcApi
             return DefaultPort;
         }
 
+        // Kiosk installs run locked down: no tray icon, no balloon, and no modal
+        // dialog a kiosk user could never dismiss. Set machine-wide by
+        // kiosk.ps1.txt at install time; it reaches the watchdog-launched session
+        // process through CreateEnvironmentBlock, which includes machine vars.
+        private static readonly bool KioskMode = ReadKioskMode();
+
+        public static bool IsKioskMode
+        {
+            get { return KioskMode; }
+        }
+
+        private static bool ReadKioskMode()
+        {
+            var raw = Environment.GetEnvironmentVariable("DUVC_API_KIOSK");
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return false;
+            }
+            var value = raw.Trim();
+            return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+        }
+
         public static string GetVersionLabel()
         {
             try
@@ -1599,7 +1623,7 @@ namespace DuvcApi
             try
             {
                 // Drop any handle from a previous failed Acquire so this call
-                // can claim ownership cleanly (e.g. after KillOtherInstances).
+                // can claim ownership cleanly on a retry.
                 if (_mutex != null)
                 {
                     try { _mutex.Close(); } catch { }
@@ -1926,6 +1950,39 @@ namespace DuvcApi
         }
     }
 
+    // Which pieces of desktop UI the tray process may show. Computed once so the
+    // kiosk decision lives in exactly one place instead of scattered env lookups.
+    internal sealed class TrayUiPolicy
+    {
+        public bool ShowTrayIcon { get; private set; }
+        public bool ShowBalloon { get; private set; }
+        public bool ShowStartupErrorDialog { get; private set; }
+
+        // Whether the Control Panel window may open at all. Until now it was
+        // unreachable on a kiosk only as a side effect of the tray icon being
+        // hidden; the show-panel request file is a second route in, so the rule
+        // is stated explicitly and enforced in ShowControlPanel itself.
+        public bool AllowControlPanel { get; private set; }
+
+        private TrayUiPolicy(bool showTrayIcon, bool showBalloon, bool showStartupErrorDialog,
+            bool allowControlPanel)
+        {
+            ShowTrayIcon = showTrayIcon;
+            ShowBalloon = showBalloon;
+            ShowStartupErrorDialog = showStartupErrorDialog;
+            AllowControlPanel = allowControlPanel;
+        }
+
+        public static TrayUiPolicy FromEnvironment()
+        {
+            if (Program.IsKioskMode)
+            {
+                return new TrayUiPolicy(false, false, false, false);
+            }
+            return new TrayUiPolicy(true, true, true, true);
+        }
+    }
+
     internal sealed class TrayApp : ApplicationContext
     {
         private static readonly TrayInstanceGuard InstanceGuard = new TrayInstanceGuard();
@@ -1951,9 +2008,27 @@ namespace DuvcApi
         private DateTime _lastStatusAt;
         private ControlPanelForm _controlPanel;
         private string _apiStartError;
+        private readonly TrayUiPolicy _ui;
+
+        // Set immediately before every "ExitThread(); return;" in the constructor
+        // once the mutex has been acquired. Mutex ownership (InstanceGuard.IsOwner)
+        // is NOT a reliable signal that startup was deliberately aborted: Release()
+        // (called from ExitThreadCore) flips IsOwner to false as a side effect, but
+        // nothing guarantees Release() keeps happening before Run() re-reads
+        // IsOwner, or that IsOwner isn't cached/moved later. Run() must consult this
+        // flag directly, before it ever looks at InstanceGuard.IsOwner, so a startup
+        // abort here can never be mistaken for "another instance is running".
+        private bool _startupAborted;
+
+        internal bool StartupAborted
+        {
+            get { return _startupAborted; }
+        }
 
         private TrayApp(bool startServer)
         {
+            _ui = TrayUiPolicy.FromEnvironment();
+
             if (!InstanceGuard.Acquire())
             {
                 return;
@@ -1985,7 +2060,7 @@ namespace DuvcApi
             _notifyIcon = new NotifyIcon
             {
                 Icon = _badIcon,
-                Visible = true,
+                Visible = _ui.ShowTrayIcon,
                 Text = Program.AppTitle
             };
 
@@ -1996,17 +2071,14 @@ namespace DuvcApi
             _taskbarListener = new TaskbarCreatedListener();
             _taskbarListener.TaskbarCreated += ReassertNotifyIcon;
 
-            // Belt-and-suspenders: if our first Visible=true above was rejected
-            // and no TaskbarCreated fires (e.g. session re-attach), re-toggle
-            // once the message pump is up.
-            var bootRetry = new System.Windows.Forms.Timer { Interval = 200 };
-            bootRetry.Tick += (s, e) =>
+            // Belt-and-suspenders: if the first Visible above was rejected and no
+            // TaskbarCreated fires (e.g. session re-attach), re-assert on a short
+            // bounded schedule. Skipped entirely in kiosk mode, where there is no
+            // icon to register.
+            if (_ui.ShowTrayIcon)
             {
-                bootRetry.Stop();
-                bootRetry.Dispose();
-                ReassertNotifyIcon();
-            };
-            bootRetry.Start();
+                StartTrayRegistrationRetries();
+            }
 
             var menu = new ContextMenuStrip();
             menu.ShowImageMargin = false;
@@ -2045,15 +2117,26 @@ namespace DuvcApi
             };
             _notifyIcon.DoubleClick += (sender, args) => ShowControlPanel();
 
+            // Drop any request left behind by a previous run, so a stale file
+            // cannot pop the Control Panel open on the next start.
+            TryDeleteShowPanelRequest();
+
             _timer = new System.Windows.Forms.Timer { Interval = 2000 };
-            _timer.Tick += (sender, args) => UpdateStatus();
+            _timer.Tick += (sender, args) =>
+            {
+                UpdateStatus();
+                PollShowPanelRequest();
+            };
             _timer.Start();
             UpdateStatus();
 
-            _notifyIcon.BalloonTipTitle = Program.AppTitle;
-            _notifyIcon.BalloonTipText = string.Format(CultureInfo.InvariantCulture,
-                "Camera API running on port {0}", Program.GetPort());
-            _notifyIcon.ShowBalloonTip(3000);
+            if (_ui.ShowBalloon)
+            {
+                _notifyIcon.BalloonTipTitle = Program.AppTitle;
+                _notifyIcon.BalloonTipText = string.Format(CultureInfo.InvariantCulture,
+                    "Camera API running on port {0}", Program.GetPort());
+                _notifyIcon.ShowBalloonTip(3000);
+            }
 
             _updater = new AutoUpdater();
             // Check-only polling for the tray menu: first check after 60 s, then hourly.
@@ -2064,17 +2147,28 @@ namespace DuvcApi
             // Surface startup problems immediately. If the API failed to start
             // (typically a port conflict with the installed service or a stale
             // tray instance), let the user open the Control Panel to clean up
-            // or exit. Otherwise open the Control Panel so the user lands on the
-            // health/service overview without an extra click.
+            // or exit. The Control Panel is never opened unprompted: the
+            // watchdog relaunches "app" on boot, unlock, and every 10 s tick,
+            // so auto-opening made the window reappear constantly.
             if (!string.IsNullOrEmpty(_apiStartError))
             {
+                if (!_ui.ShowStartupErrorDialog)
+                {
+                    // Nobody can dismiss a dialog on a kiosk. Log and exit so the
+                    // watchdog relaunches us within ~10 s and retries the bind.
+                    Logger.Error("API failed to start in kiosk mode; exiting for watchdog retry: " + _apiStartError);
+                    _startupAborted = true;
+                    ExitThread();
+                    return;
+                }
+
                 if (!ShowStartupErrorDialog(_apiStartError))
                 {
+                    _startupAborted = true;
                     ExitThread();
                     return;
                 }
             }
-            ShowControlPanel();
         }
 
         private bool ShowStartupErrorDialog(string apiError)
@@ -2176,47 +2270,47 @@ namespace DuvcApi
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             var app = new TrayApp(startServer);
+            if (app.StartupAborted)
+            {
+                // Startup was deliberately aborted from within the constructor
+                // (kiosk log-and-exit, or the user chose Exit on the startup
+                // error dialog). The mutex has already been released via
+                // ExitThreadCore; do not fall through to the "another instance"
+                // check below, which would misreport this as a real conflict.
+                return;
+            }
             if (!InstanceGuard.IsOwner)
             {
+                // An instance is already running and owns the API. Launching the
+                // exe again is how a user asks to see the Control Panel, so hand
+                // the request to the running instance and exit instead of
+                // offering to kill it -- the running instance is usually the one
+                // the watchdog started, and killing it takes the API down.
                 if (!silent)
                 {
-                    var result = MessageBox.Show(
-                        "Another instance is already running. Stop it and start a new one?",
-                        Program.AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                    if (result == DialogResult.Yes)
-                    {
-                        KillOtherInstances();
-                        app = new TrayApp(startServer);
-                        if (InstanceGuard.IsOwner)
-                        {
-                            Application.Run(app);
-                        }
-                    }
+                    RequestShowPanelFromRunningInstance();
                 }
                 return;
             }
             Application.Run(app);
         }
 
-        private static void KillOtherInstances()
+        // The running instance polls for this file every 2 s and opens its Control
+        // Panel. Best-effort: this process is about to exit either way, and it has
+        // no window of its own to report a failure in, so log and move on.
+        private static void RequestShowPanelFromRunningInstance()
         {
-            var currentPid = Process.GetCurrentProcess().Id;
-            var myName = Process.GetCurrentProcess().ProcessName;
-            foreach (var proc in Process.GetProcessesByName(myName))
+            try
             {
-                if (proc.Id != currentPid)
-                {
-                    try
-                    {
-                        proc.Kill();
-                        proc.WaitForExit(5000);
-                    }
-                    catch { }
-                }
-                proc.Dispose();
+                Directory.CreateDirectory(Paths.StateDir);
+                File.WriteAllText(Paths.ShowPanelRequestFile,
+                    DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
+                Logger.Info("Another instance owns the API; asked it to show the Control Panel.");
             }
-            // Wait for mutex to be released
-            Thread.Sleep(1000);
+            catch (Exception ex)
+            {
+                Logger.Error("Could not request the Control Panel from the running instance: " + ex.Message);
+            }
         }
 
         private void UpdateStatus()
@@ -2291,6 +2385,13 @@ namespace DuvcApi
         // survive the toggle; this just forces a fresh Shell_NotifyIcon NIM_ADD.
         private void ReassertNotifyIcon()
         {
+            // Kiosk mode deliberately hides the icon. The boot retry and every
+            // Explorer TaskbarCreated broadcast would otherwise resurrect it.
+            if (!_ui.ShowTrayIcon)
+            {
+                return;
+            }
+
             try
             {
                 _notifyIcon.Visible = false;
@@ -2301,6 +2402,34 @@ namespace DuvcApi
             {
                 Logger.Error("Reassert tray icon failed: " + ex.Message);
             }
+        }
+
+        // Gaps between re-assert attempts, so attempts land at roughly 200 ms,
+        // 5 s and 20 s after construction. Shell_NotifyIcon gives no success
+        // signal — WinForms swallows a failed NIM_ADD — so we cannot query
+        // whether registration took and must simply retry. Three attempts keeps
+        // flicker negligible while covering a cold boot where Explorer is not
+        // ready at the first attempt.
+        private static readonly int[] TrayRetryGapsMs = { 200, 4800, 15000 };
+
+        private void StartTrayRegistrationRetries()
+        {
+            var index = 0;
+            var retry = new System.Windows.Forms.Timer();
+            retry.Interval = TrayRetryGapsMs[0];
+            retry.Tick += (s, e) =>
+            {
+                ReassertNotifyIcon();
+                index++;
+                if (index >= TrayRetryGapsMs.Length)
+                {
+                    retry.Stop();
+                    retry.Dispose();
+                    return;
+                }
+                retry.Interval = TrayRetryGapsMs[index];
+            };
+            retry.Start();
         }
 
         // Opportunistic: if the service is installed but stopped, try to start it.
@@ -2511,8 +2640,49 @@ namespace DuvcApi
             }
         }
 
+        // Signalled by a second instance that could not take the mutex. Delete
+        // first, then act: if opening the panel throws, we must not retry every
+        // tick forever.
+        private void PollShowPanelRequest()
+        {
+            try
+            {
+                if (!File.Exists(Paths.ShowPanelRequestFile))
+                {
+                    return;
+                }
+                TryDeleteShowPanelRequest();
+                Logger.Info("Show-panel request received from a second instance.");
+                ShowControlPanel();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Show-panel request handling failed: " + ex.Message);
+            }
+        }
+
+        private static void TryDeleteShowPanelRequest()
+        {
+            try
+            {
+                if (File.Exists(Paths.ShowPanelRequestFile))
+                {
+                    File.Delete(Paths.ShowPanelRequestFile);
+                }
+            }
+            catch { }
+        }
+
         private void ShowControlPanel()
         {
+            // Kiosk installs show no desktop chrome. Enforced here rather than at
+            // each call site so the tray menu, the double-click handler and the
+            // show-panel request file are all covered by one rule.
+            if (!_ui.AllowControlPanel)
+            {
+                return;
+            }
+
             try
             {
                 if (_controlPanel == null || _controlPanel.IsDisposed)
@@ -3143,6 +3313,11 @@ namespace DuvcApi
         public static string LogFile { get { return Path.Combine(StateDir, "duvc-api.log"); } }
 
         public static string RequestFile { get { return Path.Combine(StateDir, "update.request"); } }
+
+        // Written by a second instance that found one already running, polled and
+        // deleted by the running instance. Same convention as RequestFile: the
+        // file's existence is the whole signal, contents are ignored.
+        public static string ShowPanelRequestFile { get { return Path.Combine(StateDir, "showpanel.request"); } }
 
         public static string CurrentExe { get { return Process.GetCurrentProcess().MainModule.FileName; } }
 
