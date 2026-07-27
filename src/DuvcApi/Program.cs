@@ -2636,12 +2636,17 @@ namespace DuvcApi
             ShowLog();
         }
 
+        // How long to wait for an elevated command before giving up on reporting its
+        // result. Restart is the slowest: it allows 30 s for the service to stop.
+        private const int ElevatedCommandTimeoutMs = 60000;
+
         private void RunElevated(string command)
         {
+            Process elevated;
             try
             {
                 var exePath = Process.GetCurrentProcess().MainModule.FileName;
-                Process.Start(new ProcessStartInfo
+                elevated = Process.Start(new ProcessStartInfo
                 {
                     FileName = exePath,
                     Arguments = command,
@@ -2658,11 +2663,98 @@ namespace DuvcApi
                 }
                 Logger.Error("Elevation failed: " + ex.Message);
                 MessageBox.Show("Failed to run as administrator: " + ex.Message, Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
             }
             catch (Exception ex)
             {
                 Logger.Error("Elevation failed: " + ex.Message);
                 MessageBox.Show("Failed to run as administrator: " + ex.Message, Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (elevated == null)
+            {
+                return;
+            }
+
+            WatchElevatedCommand(elevated, command);
+        }
+
+        // The elevated helper is the same winexe as this process, so it has no
+        // console and everything it writes to stderr is discarded. Its exit code is
+        // the only evidence we get that the command worked. Without this the user
+        // clicks an action, the UAC prompt appears and vanishes, and a failure looks
+        // exactly like a success.
+        //
+        // Waiting happens off the UI thread: a Restart Watchdog can take tens of
+        // seconds and must not freeze the Control Panel.
+        private static void WatchElevatedCommand(Process elevated, string command)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                int exitCode;
+                try
+                {
+                    if (!elevated.WaitForExit(ElevatedCommandTimeoutMs))
+                    {
+                        Logger.Error("Elevated '" + command + "' did not finish within "
+                            + (ElevatedCommandTimeoutMs / 1000) + "s; not reporting a result.");
+                        return;
+                    }
+                    exitCode = elevated.ExitCode;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error("Could not read the result of elevated '" + command + "': " + ex.Message);
+                    return;
+                }
+                finally
+                {
+                    try { elevated.Dispose(); } catch { }
+                }
+
+                if (exitCode == 0)
+                {
+                    Logger.Info("Elevated '" + command + "' succeeded.");
+                    return;
+                }
+
+                var detail = DescribeElevatedFailure(command, exitCode);
+                Logger.Error("Elevated '" + command + "' failed with exit code " + exitCode + ". " + detail);
+
+                // Shown straight from this thread rather than marshalled onto the UI
+                // thread: MessageBox is a Win32 dialog and is safe to open from any
+                // thread, and the Control Panel may well have been closed by now, so
+                // there is no reliable control to invoke through.
+                MessageBox.Show(detail, Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            });
+        }
+
+        private static string DescribeElevatedFailure(string command, int exitCode)
+        {
+            var action = FriendlyCommandName(command);
+            switch (exitCode)
+            {
+                case 1:
+                    return action + " failed because the service is not installed.";
+                case 5:
+                    return action + " failed: access was denied. Administrator rights are required, "
+                        + "and this machine's policy may be blocking the change.";
+                default:
+                    return action + " failed (exit code " + exitCode
+                        + "). See the log for details — open it from API debugging.";
+            }
+        }
+
+        private static string FriendlyCommandName(string command)
+        {
+            switch (command)
+            {
+                case "install": return "Install Service";
+                case "uninstall": return "Uninstall Service";
+                case "startservice": return "Start Watchdog";
+                case "restartservice": return "Restart Watchdog";
+                default: return command;
             }
         }
 
