@@ -1,3 +1,10 @@
+param(
+    # Build somewhere other than dist\duvc-api.exe. csc fails with CS0016 when the
+    # target is locked by a running instance, so point this at a scratch path when
+    # a local duvc-api.exe is up.
+    [string]$OutputPath
+)
+
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -37,7 +44,7 @@ if (-not (Test-Path $csc)) {
     throw "csc.exe not found. Install .NET Framework 4.8 developer tools."
 }
 
-$output = Join-Path $dist "duvc-api.exe"
+$output = if ($OutputPath) { $OutputPath } else { Join-Path $dist "duvc-api.exe" }
 
 & $csc `
     /nologo `
