@@ -798,6 +798,14 @@ if ($InstallDuvc) {
         $duvcExePath = Join-Path $duvcDir 'duvc-api.exe'
         $duvcServiceName = 'DuvcApi'
 
+        # Kiosk tablets run with no desktop chrome: duvc-api reads this at startup
+        # and suppresses its tray icon, balloon, and modal dialogs. Machine scope
+        # so the SYSTEM watchdog and the session process it launches via
+        # CreateProcessAsUser/CreateEnvironmentBlock both inherit it. Set before
+        # the service is installed or started so it takes effect immediately.
+        [Environment]::SetEnvironmentVariable('DUVC_API_KIOSK', '1', 'Machine')
+        $env:DUVC_API_KIOSK = '1'
+
         $service = Get-Service -Name $duvcServiceName -ErrorAction SilentlyContinue
         if (-not $service -or -not (Test-Path $duvcExePath)) {
             $tmpExe = Join-Path $env:TEMP 'duvc-api.exe'
