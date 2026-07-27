@@ -44,6 +44,8 @@ namespace DuvcApi
                         return ServiceInstaller.Install(ServiceNameConst, ServiceDisplayName);
                     case "uninstall":
                         return ServiceInstaller.Uninstall(ServiceNameConst);
+                    case "restartservice":
+                        return ServiceInstaller.RestartIfInstalled(ServiceNameConst);
                     case "startservice":
                         return ServiceInstaller.StartIfInstalled(ServiceNameConst);
                     case "service":
@@ -62,7 +64,7 @@ namespace DuvcApi
                         LogApp.Run();
                         return 0;
                     default:
-                        Console.Error.WriteLine("Unknown command. Use: install | uninstall | startservice | service | tray | run");
+                        Console.Error.WriteLine("Unknown command. Use: install | uninstall | startservice | restartservice | service | tray | run");
                         return 2;
                 }
             }
@@ -1783,6 +1785,53 @@ namespace DuvcApi
                 Console.WriteLine("Service is already running.");
                 return 0;
             }
+            return RunSc(string.Format(CultureInfo.InvariantCulture, "start {0}", serviceName));
+        }
+
+        // Stop, wait, start. Deliberately separate from StartIfInstalled, which
+        // reports success immediately when the service is already running — no use
+        // for the case this exists to serve, where the service IS running but is
+        // still executing an image an update renamed away. Until it restarts it
+        // reports a stale version and keeps its old exe slot pinned.
+        public static int RestartIfInstalled(string serviceName)
+        {
+            var status = ServiceStatusHelper.GetStatus(serviceName);
+            if (!status.IsInstalled)
+            {
+                Console.Error.WriteLine("Service is not installed.");
+                return 1;
+            }
+
+            if (status.IsRunning)
+            {
+                var stopResult = RunSc(string.Format(CultureInfo.InvariantCulture, "stop {0}", serviceName));
+                if (stopResult != 0)
+                {
+                    Console.Error.WriteLine("Could not stop the service.");
+                    return stopResult;
+                }
+
+                // sc returns as soon as the stop control is accepted, not when the
+                // process is gone. Starting again too early fails.
+                try
+                {
+                    using (var controller = new ServiceController(serviceName))
+                    {
+                        controller.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    }
+                }
+                catch (System.ServiceProcess.TimeoutException)
+                {
+                    Console.Error.WriteLine("Service did not stop within 30 seconds.");
+                    return 1;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Waiting for the service to stop failed: " + ex.Message);
+                    return 1;
+                }
+            }
+
             return RunSc(string.Format(CultureInfo.InvariantCulture, "start {0}", serviceName));
         }
 
@@ -4651,7 +4700,7 @@ namespace DuvcApi
         private Label _modeLabel;
         private StatusBullet _camerasBullet, _watchdogBullet, _serviceBullet;
         private Label _camerasLabel, _watchdogLabel, _serviceStatusLabel;
-        private LinkLabel _installLink, _uninstallLink, _startWatchdogLink;
+        private LinkLabel _installLink, _uninstallLink, _startWatchdogLink, _restartWatchdogLink;
         private LinkLabel _showHealthLink, _showLogLink;
         private Label _svcSep1, _svcSep2;
         private LinkLabel _openExeFolderLink, _openStateFolderLink, _openLogFolderLink;
@@ -4843,6 +4892,10 @@ namespace DuvcApi
             _uninstallLink      = NewActionLink("Uninstall Service", () => _tray.RunElevatedFromControlPanel("uninstall"));
             _startWatchdogLink  = NewActionLink("Start Watchdog",    () => _tray.RunElevatedFromControlPanel("startservice"));
             _startWatchdogLink.Visible = false;
+            // Shown when the service is running: the only way to make it reload its
+            // binary, and the remedy when it is running but stuck on a stale image.
+            _restartWatchdogLink = NewActionLink("Restart Watchdog", () => _tray.RunElevatedFromControlPanel("restartservice"));
+            _restartWatchdogLink.Visible = false;
             _svcSep1 = NewSeparatorLabel();
             _svcSep2 = NewSeparatorLabel();
             _svcSep2.Visible = false;
@@ -4851,6 +4904,7 @@ namespace DuvcApi
             svcActions.Controls.Add(_uninstallLink);
             svcActions.Controls.Add(_svcSep2);
             svcActions.Controls.Add(_startWatchdogLink);
+            svcActions.Controls.Add(_restartWatchdogLink);
             grid.Controls.Add(svcActions, 2, 2);
 
             box.Controls.Add(grid);
@@ -5281,6 +5335,7 @@ namespace DuvcApi
                 _uninstallLink.Visible = false;
                 _svcSep1.Visible = false;
                 _startWatchdogLink.Visible = false;
+                _restartWatchdogLink.Visible = false;
                 _svcSep2.Visible = false;
             }
             else if (svc.IsRunning)
@@ -5291,7 +5346,10 @@ namespace DuvcApi
                 _uninstallLink.Visible = true;
                 _svcSep1.Visible = false;
                 _startWatchdogLink.Visible = false;
-                _svcSep2.Visible = false;
+                // Running is exactly when a restart is the only available remedy:
+                // the service reloads its binary on no other occasion.
+                _restartWatchdogLink.Visible = true;
+                _svcSep2.Visible = true;
             }
             else
             {
@@ -5301,6 +5359,7 @@ namespace DuvcApi
                 _uninstallLink.Visible = true;
                 _svcSep1.Visible = false;
                 _startWatchdogLink.Visible = true;
+                _restartWatchdogLink.Visible = false;
                 _svcSep2.Visible = true;
             }
         }
