@@ -2002,6 +2002,21 @@ namespace DuvcApi
         private string _apiStartError;
         private readonly TrayUiPolicy _ui;
 
+        // Set immediately before every "ExitThread(); return;" in the constructor
+        // once the mutex has been acquired. Mutex ownership (InstanceGuard.IsOwner)
+        // is NOT a reliable signal that startup was deliberately aborted: Release()
+        // (called from ExitThreadCore) flips IsOwner to false as a side effect, but
+        // nothing guarantees Release() keeps happening before Run() re-reads
+        // IsOwner, or that IsOwner isn't cached/moved later. Run() must consult this
+        // flag directly, before it ever looks at InstanceGuard.IsOwner, so a startup
+        // abort here can never be mistaken for "another instance is running".
+        private bool _startupAborted;
+
+        internal bool StartupAborted
+        {
+            get { return _startupAborted; }
+        }
+
         private TrayApp(bool startServer)
         {
             _ui = TrayUiPolicy.FromEnvironment();
@@ -2126,12 +2141,14 @@ namespace DuvcApi
                     // Nobody can dismiss a dialog on a kiosk. Log and exit so the
                     // watchdog relaunches us within ~10 s and retries the bind.
                     Logger.Error("API failed to start in kiosk mode; exiting for watchdog retry: " + _apiStartError);
+                    _startupAborted = true;
                     ExitThread();
                     return;
                 }
 
                 if (!ShowStartupErrorDialog(_apiStartError))
                 {
+                    _startupAborted = true;
                     ExitThread();
                     return;
                 }
@@ -2237,6 +2254,15 @@ namespace DuvcApi
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             var app = new TrayApp(startServer);
+            if (app.StartupAborted)
+            {
+                // Startup was deliberately aborted from within the constructor
+                // (kiosk log-and-exit, or the user chose Exit on the startup
+                // error dialog). The mutex has already been released via
+                // ExitThreadCore; do not fall through to the "another instance"
+                // check below, which would misreport this as a real conflict.
+                return;
+            }
             if (!InstanceGuard.IsOwner)
             {
                 if (!silent)
@@ -2248,6 +2274,10 @@ namespace DuvcApi
                     {
                         KillOtherInstances();
                         app = new TrayApp(startServer);
+                        if (app.StartupAborted)
+                        {
+                            return;
+                        }
                         if (InstanceGuard.IsOwner)
                         {
                             Application.Run(app);
