@@ -2119,17 +2119,26 @@ namespace DuvcApi
             // Surface startup problems immediately. If the API failed to start
             // (typically a port conflict with the installed service or a stale
             // tray instance), let the user open the Control Panel to clean up
-            // or exit. Otherwise open the Control Panel so the user lands on the
-            // health/service overview without an extra click.
+            // or exit. The Control Panel is never opened unprompted: the
+            // watchdog relaunches "app" on boot, unlock, and every 10 s tick,
+            // so auto-opening made the window reappear constantly.
             if (!string.IsNullOrEmpty(_apiStartError))
             {
+                if (!_ui.ShowStartupErrorDialog)
+                {
+                    // Nobody can dismiss a dialog on a kiosk. Log and exit so the
+                    // watchdog relaunches us within ~10 s and retries the bind.
+                    Logger.Error("API failed to start in kiosk mode; exiting for watchdog retry: " + _apiStartError);
+                    ExitThread();
+                    return;
+                }
+
                 if (!ShowStartupErrorDialog(_apiStartError))
                 {
                     ExitThread();
                     return;
                 }
             }
-            ShowControlPanel();
         }
 
         private bool ShowStartupErrorDialog(string apiError)
