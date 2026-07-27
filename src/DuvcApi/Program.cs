@@ -113,6 +113,30 @@ namespace DuvcApi
             return DefaultPort;
         }
 
+        // Kiosk installs run locked down: no tray icon, no balloon, and no modal
+        // dialog a kiosk user could never dismiss. Set machine-wide by
+        // kiosk.ps1.txt at install time; it reaches the watchdog-launched session
+        // process through CreateEnvironmentBlock, which includes machine vars.
+        private static readonly bool KioskMode = ReadKioskMode();
+
+        public static bool IsKioskMode
+        {
+            get { return KioskMode; }
+        }
+
+        private static bool ReadKioskMode()
+        {
+            var raw = Environment.GetEnvironmentVariable("DUVC_API_KIOSK");
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return false;
+            }
+            var value = raw.Trim();
+            return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+        }
+
         public static string GetVersionLabel()
         {
             try
@@ -1926,6 +1950,31 @@ namespace DuvcApi
         }
     }
 
+    // Which pieces of desktop UI the tray process may show. Computed once so the
+    // kiosk decision lives in exactly one place instead of scattered env lookups.
+    internal sealed class TrayUiPolicy
+    {
+        public bool ShowTrayIcon { get; private set; }
+        public bool ShowBalloon { get; private set; }
+        public bool ShowStartupErrorDialog { get; private set; }
+
+        private TrayUiPolicy(bool showTrayIcon, bool showBalloon, bool showStartupErrorDialog)
+        {
+            ShowTrayIcon = showTrayIcon;
+            ShowBalloon = showBalloon;
+            ShowStartupErrorDialog = showStartupErrorDialog;
+        }
+
+        public static TrayUiPolicy FromEnvironment()
+        {
+            if (Program.IsKioskMode)
+            {
+                return new TrayUiPolicy(false, false, false);
+            }
+            return new TrayUiPolicy(true, true, true);
+        }
+    }
+
     internal sealed class TrayApp : ApplicationContext
     {
         private static readonly TrayInstanceGuard InstanceGuard = new TrayInstanceGuard();
@@ -1951,9 +2000,12 @@ namespace DuvcApi
         private DateTime _lastStatusAt;
         private ControlPanelForm _controlPanel;
         private string _apiStartError;
+        private readonly TrayUiPolicy _ui;
 
         private TrayApp(bool startServer)
         {
+            _ui = TrayUiPolicy.FromEnvironment();
+
             if (!InstanceGuard.Acquire())
             {
                 return;
@@ -1985,7 +2037,7 @@ namespace DuvcApi
             _notifyIcon = new NotifyIcon
             {
                 Icon = _badIcon,
-                Visible = true,
+                Visible = _ui.ShowTrayIcon,
                 Text = Program.AppTitle
             };
 
@@ -2050,10 +2102,13 @@ namespace DuvcApi
             _timer.Start();
             UpdateStatus();
 
-            _notifyIcon.BalloonTipTitle = Program.AppTitle;
-            _notifyIcon.BalloonTipText = string.Format(CultureInfo.InvariantCulture,
-                "Camera API running on port {0}", Program.GetPort());
-            _notifyIcon.ShowBalloonTip(3000);
+            if (_ui.ShowBalloon)
+            {
+                _notifyIcon.BalloonTipTitle = Program.AppTitle;
+                _notifyIcon.BalloonTipText = string.Format(CultureInfo.InvariantCulture,
+                    "Camera API running on port {0}", Program.GetPort());
+                _notifyIcon.ShowBalloonTip(3000);
+            }
 
             _updater = new AutoUpdater();
             // Check-only polling for the tray menu: first check after 60 s, then hourly.
@@ -2291,6 +2346,13 @@ namespace DuvcApi
         // survive the toggle; this just forces a fresh Shell_NotifyIcon NIM_ADD.
         private void ReassertNotifyIcon()
         {
+            // Kiosk mode deliberately hides the icon. The boot retry and every
+            // Explorer TaskbarCreated broadcast would otherwise resurrect it.
+            if (!_ui.ShowTrayIcon)
+            {
+                return;
+            }
+
             try
             {
                 _notifyIcon.Visible = false;
