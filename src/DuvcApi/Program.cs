@@ -44,6 +44,8 @@ namespace DuvcApi
                         return ServiceInstaller.Install(ServiceNameConst, ServiceDisplayName);
                     case "uninstall":
                         return ServiceInstaller.Uninstall(ServiceNameConst);
+                    case "restartservice":
+                        return ServiceInstaller.RestartIfInstalled(ServiceNameConst);
                     case "startservice":
                         return ServiceInstaller.StartIfInstalled(ServiceNameConst);
                     case "service":
@@ -62,7 +64,7 @@ namespace DuvcApi
                         LogApp.Run();
                         return 0;
                     default:
-                        Console.Error.WriteLine("Unknown command. Use: install | uninstall | startservice | service | tray | run");
+                        Console.Error.WriteLine("Unknown command. Use: install | uninstall | startservice | restartservice | service | tray | run");
                         return 2;
                 }
             }
@@ -194,6 +196,12 @@ namespace DuvcApi
         private readonly AutoUpdater _updater = new AutoUpdater();
         private DateTime _lastUpdateCheckUtc = DateTime.MinValue;
 
+        // Consecutive RunUpdate failures. Nothing else reports update health: the
+        // service has no UI and the tray polls check-only, so a wedged updater is
+        // otherwise invisible outside the log.
+        private const int ConsecutiveFailureAlertThreshold = 3;
+        private int _consecutiveUpdateFailures;
+
         public DuvcApiService(string serviceName, string displayName)
         {
             ServiceName = serviceName;
@@ -205,9 +213,13 @@ namespace DuvcApi
 
         protected override void OnStart(string[] args)
         {
-            // Clean up a leftover renamed exe from a previous update, if it is no
-            // longer locked.
-            TryDelete(Paths.OldExe(Paths.CurrentExe));
+            // Clean up every renamed exe left by previous updates that is no longer
+            // locked. A restart is the only time the image we ourselves were running
+            // from becomes deletable, so this is where the slots get reclaimed.
+            foreach (var stale in Paths.OldExePaths(Paths.CurrentExe))
+            {
+                TryDelete(stale);
+            }
 
             _running = true;
             _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "DuvcApiWatchdog" };
@@ -299,6 +311,10 @@ namespace DuvcApi
                 var info = _updater.CheckForUpdate();
                 if (info == null)
                 {
+                    // Nothing to do — also the signal that any earlier failure run
+                    // has resolved (typically the update did land and the on-disk
+                    // version now matches).
+                    _consecutiveUpdateFailures = 0;
                     return;
                 }
 
@@ -308,9 +324,11 @@ namespace DuvcApi
                     return;
                 }
 
-                var exe = Paths.CurrentExe;
+                // Operate on the canonical path, not CurrentExe: if a previous
+                // update renamed our own image away, CurrentExe now points at that
+                // renamed file and swapping it would corrupt the install.
+                var exe = Paths.CanonicalExe;
                 var backup = Paths.BackupExe(exe);
-                var old = Paths.OldExe(exe);
                 var cli = Paths.SiblingCli(exe);
 
                 // Back up the current canonical exe (copy from a running image is allowed).
@@ -319,7 +337,11 @@ namespace DuvcApi
                 // Rename the running exe out of the way. Renaming a running image is
                 // allowed on Windows; the service and any app process keep running
                 // from the renamed file. This frees the canonical path.
-                TryDelete(old);
+                //
+                // The target name is reserved fresh each time: earlier slots may
+                // still be pinned by processes running from them, and a locked slot
+                // must not block the update.
+                var old = Paths.ReserveOldExePath(exe);
                 File.Move(exe, old);
 
                 // Place the new exe at the canonical path and drop the sibling CLI so
@@ -332,6 +354,7 @@ namespace DuvcApi
                 StopApp();
                 SessionLauncher.TryLaunchInActiveSession(exe, "app");
                 Logger.Info("Update applied: v" + info.Version);
+                _consecutiveUpdateFailures = 0;
 
                 // Rollback if the new version never reports healthy.
                 if (!WaitForHealthy(TimeSpan.FromSeconds(30)))
@@ -354,7 +377,21 @@ namespace DuvcApi
             }
             catch (Exception ex)
             {
+                _consecutiveUpdateFailures++;
                 Logger.Error("Update failed: " + ex.Message);
+
+                // A single failure is usually transient (network, a file briefly in
+                // use). A run of them is not, and nothing else tells anyone: the
+                // service has no UI and the tray only ever does check-only polling.
+                // Say so in terms an operator can act on rather than repeating the
+                // same line hourly forever.
+                if (_consecutiveUpdateFailures >= ConsecutiveFailureAlertThreshold)
+                {
+                    Logger.Error(string.Format(CultureInfo.InvariantCulture,
+                        "Auto-update has now failed {0} times in a row and will not recover on its own. "
+                        + "Restart the {1} service to clear it; if that does not help, the install at {2} needs attention.",
+                        _consecutiveUpdateFailures, ServiceName, Paths.CanonicalExe));
+                }
                 // Best-effort recovery: if the canonical exe is missing/broken, restore
                 // the backup so the watchdog can relaunch something working.
                 try
@@ -1751,6 +1788,53 @@ namespace DuvcApi
             return RunSc(string.Format(CultureInfo.InvariantCulture, "start {0}", serviceName));
         }
 
+        // Stop, wait, start. Deliberately separate from StartIfInstalled, which
+        // reports success immediately when the service is already running — no use
+        // for the case this exists to serve, where the service IS running but is
+        // still executing an image an update renamed away. Until it restarts it
+        // reports a stale version and keeps its old exe slot pinned.
+        public static int RestartIfInstalled(string serviceName)
+        {
+            var status = ServiceStatusHelper.GetStatus(serviceName);
+            if (!status.IsInstalled)
+            {
+                Console.Error.WriteLine("Service is not installed.");
+                return 1;
+            }
+
+            if (status.IsRunning)
+            {
+                var stopResult = RunSc(string.Format(CultureInfo.InvariantCulture, "stop {0}", serviceName));
+                if (stopResult != 0)
+                {
+                    Console.Error.WriteLine("Could not stop the service.");
+                    return stopResult;
+                }
+
+                // sc returns as soon as the stop control is accepted, not when the
+                // process is gone. Starting again too early fails.
+                try
+                {
+                    using (var controller = new ServiceController(serviceName))
+                    {
+                        controller.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    }
+                }
+                catch (System.ServiceProcess.TimeoutException)
+                {
+                    Console.Error.WriteLine("Service did not stop within 30 seconds.");
+                    return 1;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Waiting for the service to stop failed: " + ex.Message);
+                    return 1;
+                }
+            }
+
+            return RunSc(string.Format(CultureInfo.InvariantCulture, "start {0}", serviceName));
+        }
+
         private static int RunSc(string arguments)
         {
             var startInfo = new ProcessStartInfo
@@ -2552,12 +2636,17 @@ namespace DuvcApi
             ShowLog();
         }
 
+        // How long to wait for an elevated command before giving up on reporting its
+        // result. Restart is the slowest: it allows 30 s for the service to stop.
+        private const int ElevatedCommandTimeoutMs = 60000;
+
         private void RunElevated(string command)
         {
+            Process elevated;
             try
             {
                 var exePath = Process.GetCurrentProcess().MainModule.FileName;
-                Process.Start(new ProcessStartInfo
+                elevated = Process.Start(new ProcessStartInfo
                 {
                     FileName = exePath,
                     Arguments = command,
@@ -2574,11 +2663,98 @@ namespace DuvcApi
                 }
                 Logger.Error("Elevation failed: " + ex.Message);
                 MessageBox.Show("Failed to run as administrator: " + ex.Message, Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
             }
             catch (Exception ex)
             {
                 Logger.Error("Elevation failed: " + ex.Message);
                 MessageBox.Show("Failed to run as administrator: " + ex.Message, Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (elevated == null)
+            {
+                return;
+            }
+
+            WatchElevatedCommand(elevated, command);
+        }
+
+        // The elevated helper is the same winexe as this process, so it has no
+        // console and everything it writes to stderr is discarded. Its exit code is
+        // the only evidence we get that the command worked. Without this the user
+        // clicks an action, the UAC prompt appears and vanishes, and a failure looks
+        // exactly like a success.
+        //
+        // Waiting happens off the UI thread: a Restart Watchdog can take tens of
+        // seconds and must not freeze the Control Panel.
+        private static void WatchElevatedCommand(Process elevated, string command)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                int exitCode;
+                try
+                {
+                    if (!elevated.WaitForExit(ElevatedCommandTimeoutMs))
+                    {
+                        Logger.Error("Elevated '" + command + "' did not finish within "
+                            + (ElevatedCommandTimeoutMs / 1000) + "s; not reporting a result.");
+                        return;
+                    }
+                    exitCode = elevated.ExitCode;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error("Could not read the result of elevated '" + command + "': " + ex.Message);
+                    return;
+                }
+                finally
+                {
+                    try { elevated.Dispose(); } catch { }
+                }
+
+                if (exitCode == 0)
+                {
+                    Logger.Info("Elevated '" + command + "' succeeded.");
+                    return;
+                }
+
+                var detail = DescribeElevatedFailure(command, exitCode);
+                Logger.Error("Elevated '" + command + "' failed with exit code " + exitCode + ". " + detail);
+
+                // Shown straight from this thread rather than marshalled onto the UI
+                // thread: MessageBox is a Win32 dialog and is safe to open from any
+                // thread, and the Control Panel may well have been closed by now, so
+                // there is no reliable control to invoke through.
+                MessageBox.Show(detail, Program.AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            });
+        }
+
+        private static string DescribeElevatedFailure(string command, int exitCode)
+        {
+            var action = FriendlyCommandName(command);
+            switch (exitCode)
+            {
+                case 1:
+                    return action + " failed because the service is not installed.";
+                case 5:
+                    return action + " failed: access was denied. Administrator rights are required, "
+                        + "and this machine's policy may be blocking the change.";
+                default:
+                    return action + " failed (exit code " + exitCode
+                        + "). See the log for details — open it from API debugging.";
+            }
+        }
+
+        private static string FriendlyCommandName(string command)
+        {
+            switch (command)
+            {
+                case "install": return "Install Service";
+                case "uninstall": return "Uninstall Service";
+                case "startservice": return "Start Watchdog";
+                case "restartservice": return "Restart Watchdog";
+                default: return command;
             }
         }
 
@@ -3151,11 +3327,64 @@ namespace DuvcApi
             return Path.Combine(Path.GetDirectoryName(exePath), "duvc-api.bak.exe");
         }
 
-        // The running exe is renamed here during a service-driven update so the new
-        // exe can take the canonical path while this process keeps running.
-        public static string OldExe(string exePath)
+        private const string OldExePrefix = "duvc-api.old";
+
+        // The path the service and installer treat as canonical. This is NOT always
+        // CurrentExe: an update renames the running image out of the way, and from
+        // then on CurrentExe reports that renamed path for the life of the process.
+        // Anything that wants "the installed version" must look here.
+        public static string CanonicalExe
         {
-            return Path.Combine(Path.GetDirectoryName(exePath), "duvc-api.old.exe");
+            get { return Path.Combine(Path.GetDirectoryName(CurrentExe), "duvc-api.exe"); }
+        }
+
+        // Reserves a free name to rename the running exe to during an update.
+        //
+        // The name MUST be allowed to vary. A previous update renamed this very
+        // process's image to one of these paths, and Windows cannot delete a loaded
+        // image — so the slot stays occupied for as long as the process lives.
+        // Reusing one fixed name meant the first update pinned it and every later
+        // update died on File.Move with "Cannot create a file when that file
+        // already exists", permanently, until the service restarted.
+        public static string ReserveOldExePath(string exePath)
+        {
+            var dir = Path.GetDirectoryName(exePath);
+            for (var i = 0; i < 100; i++)
+            {
+                var name = i == 0
+                    ? OldExePrefix + ".exe"
+                    : OldExePrefix + "." + i.ToString(CultureInfo.InvariantCulture) + ".exe";
+                var candidate = Path.Combine(dir, name);
+
+                if (!File.Exists(candidate))
+                {
+                    return candidate;
+                }
+                try
+                {
+                    File.Delete(candidate);
+                    return candidate;
+                }
+                catch
+                {
+                    // Locked — almost certainly a still-running image from an
+                    // earlier update. Leave it alone and take the next slot.
+                }
+            }
+            throw new IOException("No free " + OldExePrefix + " slot in " + dir);
+        }
+
+        // Every renamed-away image in the exe directory, for best-effort cleanup.
+        public static string[] OldExePaths(string exePath)
+        {
+            try
+            {
+                return Directory.GetFiles(Path.GetDirectoryName(exePath), OldExePrefix + "*.exe");
+            }
+            catch
+            {
+                return new string[0];
+            }
         }
 
         public static string SiblingCli(string exePath)
@@ -3175,11 +3404,40 @@ namespace DuvcApi
     {
         private const string ReleasesUrl = "https://api.github.com/repos/eriksp/duvc-api/releases/latest";
         private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
-        private readonly string _currentVersion;
+        // Not readonly: a successful update changes the installed version underneath
+        // a long-lived service process, so this is refreshed on every check.
+        private string _currentVersion;
 
         public AutoUpdater()
         {
-            _currentVersion = Program.GetVersionLabel().TrimStart('v');
+            _currentVersion = ReadInstalledVersion();
+        }
+
+        // Deliberately the version of the exe ON DISK at the canonical path, not
+        // this process's own assembly version. After an update renames the running
+        // image away, a long-lived service keeps reporting the version it booted
+        // with — so comparing against itself made it re-download and re-apply an
+        // update that had already landed, every hour, forever.
+        private static string ReadInstalledVersion()
+        {
+            try
+            {
+                var canonical = Paths.CanonicalExe;
+                if (File.Exists(canonical))
+                {
+                    var onDisk = FileVersionInfo.GetVersionInfo(canonical).FileVersion;
+                    if (!string.IsNullOrWhiteSpace(onDisk))
+                    {
+                        return onDisk.Trim();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Could not read installed version from disk: " + ex.Message);
+            }
+            // Fall back to our own assembly version; worst case we behave as before.
+            return Program.GetVersionLabel().TrimStart('v');
         }
 
         // Last result of CheckForUpdate(): non-null when a newer release exists.
@@ -3194,6 +3452,12 @@ namespace DuvcApi
         {
             try
             {
+                // Re-read rather than trusting the value captured at construction:
+                // the service lives for weeks and the exe on disk changes under it.
+                // Without this the updater keeps comparing against the version it
+                // booted with and re-applies an update that already landed.
+                _currentVersion = ReadInstalledVersion();
+
                 string tagName, exeUrl, sha256Url;
                 if (!FetchLatestRelease(out tagName, out exeUrl, out sha256Url))
                 {
@@ -4528,7 +4792,7 @@ namespace DuvcApi
         private Label _modeLabel;
         private StatusBullet _camerasBullet, _watchdogBullet, _serviceBullet;
         private Label _camerasLabel, _watchdogLabel, _serviceStatusLabel;
-        private LinkLabel _installLink, _uninstallLink, _startWatchdogLink;
+        private LinkLabel _installLink, _uninstallLink, _startWatchdogLink, _restartWatchdogLink;
         private LinkLabel _showHealthLink, _showLogLink;
         private Label _svcSep1, _svcSep2;
         private LinkLabel _openExeFolderLink, _openStateFolderLink, _openLogFolderLink;
@@ -4720,6 +4984,10 @@ namespace DuvcApi
             _uninstallLink      = NewActionLink("Uninstall Service", () => _tray.RunElevatedFromControlPanel("uninstall"));
             _startWatchdogLink  = NewActionLink("Start Watchdog",    () => _tray.RunElevatedFromControlPanel("startservice"));
             _startWatchdogLink.Visible = false;
+            // Shown when the service is running: the only way to make it reload its
+            // binary, and the remedy when it is running but stuck on a stale image.
+            _restartWatchdogLink = NewActionLink("Restart Watchdog", () => _tray.RunElevatedFromControlPanel("restartservice"));
+            _restartWatchdogLink.Visible = false;
             _svcSep1 = NewSeparatorLabel();
             _svcSep2 = NewSeparatorLabel();
             _svcSep2.Visible = false;
@@ -4728,6 +4996,7 @@ namespace DuvcApi
             svcActions.Controls.Add(_uninstallLink);
             svcActions.Controls.Add(_svcSep2);
             svcActions.Controls.Add(_startWatchdogLink);
+            svcActions.Controls.Add(_restartWatchdogLink);
             grid.Controls.Add(svcActions, 2, 2);
 
             box.Controls.Add(grid);
@@ -5158,6 +5427,7 @@ namespace DuvcApi
                 _uninstallLink.Visible = false;
                 _svcSep1.Visible = false;
                 _startWatchdogLink.Visible = false;
+                _restartWatchdogLink.Visible = false;
                 _svcSep2.Visible = false;
             }
             else if (svc.IsRunning)
@@ -5168,7 +5438,10 @@ namespace DuvcApi
                 _uninstallLink.Visible = true;
                 _svcSep1.Visible = false;
                 _startWatchdogLink.Visible = false;
-                _svcSep2.Visible = false;
+                // Running is exactly when a restart is the only available remedy:
+                // the service reloads its binary on no other occasion.
+                _restartWatchdogLink.Visible = true;
+                _svcSep2.Visible = true;
             }
             else
             {
@@ -5178,6 +5451,7 @@ namespace DuvcApi
                 _uninstallLink.Visible = true;
                 _svcSep1.Visible = false;
                 _startWatchdogLink.Visible = true;
+                _restartWatchdogLink.Visible = false;
                 _svcSep2.Visible = true;
             }
         }
